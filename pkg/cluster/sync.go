@@ -2,17 +2,18 @@ package cluster
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"reflect"
 	"regexp"
 	"strings"
+	"time"
 
 	acidv1 "github.com/zalando/postgres-operator/pkg/apis/acid.zalan.do/v1"
 	"github.com/zalando/postgres-operator/pkg/spec"
 	"github.com/zalando/postgres-operator/pkg/util"
 	"github.com/zalando/postgres-operator/pkg/util/constants"
 	"github.com/zalando/postgres-operator/pkg/util/k8sutil"
-	"github.com/zalando/postgres-operator/pkg/util/volumes"
-	appsv1 "k8s.io/api/apps/v1"
 	batchv1beta1 "k8s.io/api/batch/v1beta1"
 	v1 "k8s.io/api/core/v1"
 	policybeta1 "k8s.io/api/policy/v1beta1"
@@ -43,40 +44,27 @@ func (c *Cluster) Sync(newSpec *acidv1.Postgresql) error {
 		return err
 	}
 
-	c.logger.Debugf("syncing secrets")
-
 	//TODO: mind the secrets of the deleted/new users
 	if err = c.syncSecrets(); err != nil {
 		err = fmt.Errorf("could not sync secrets: %v", err)
 		return err
 	}
 
-	c.logger.Debugf("syncing services")
 	if err = c.syncServices(); err != nil {
 		err = fmt.Errorf("could not sync services: %v", err)
 		return err
 	}
 
-	if c.OpConfig.StorageResizeMode == "pvc" {
-		c.logger.Debugf("syncing persistent volume claims")
-		if err = c.syncVolumeClaims(); err != nil {
-			err = fmt.Errorf("could not sync persistent volume claims: %v", err)
+	// sync volume may already transition volumes to gp3, if iops/throughput or type is specified
+	if err = c.syncVolumes(); err != nil {
+		return err
+	}
+
+	if c.OpConfig.EnableEBSGp3Migration {
+		err = c.executeEBSMigration()
+		if nil != err {
 			return err
 		}
-	} else if c.OpConfig.StorageResizeMode == "ebs" {
-		// potentially enlarge volumes before changing the statefulset. By doing that
-		// in this order we make sure the operator is not stuck waiting for a pod that
-		// cannot start because it ran out of disk space.
-		// TODO: handle the case of the cluster that is downsized and enlarged again
-		// (there will be a volume from the old pod for which we can't act before the
-		//  the statefulset modification is concluded)
-		c.logger.Debugf("syncing persistent volumes")
-		if err = c.syncVolumes(); err != nil {
-			err = fmt.Errorf("could not sync persistent volumes: %v", err)
-			return err
-		}
-	} else {
-		c.logger.Infof("Storage resize is disabled (storage_resize_mode is off). Skipping volume sync.")
 	}
 
 	if err = c.enforceMinResourceLimits(&c.Spec); err != nil {
@@ -130,6 +118,11 @@ func (c *Cluster) Sync(newSpec *acidv1.Postgresql) error {
 	// sync connection pooler
 	if _, err = c.syncConnectionPooler(&oldSpec, newSpec, c.installLookupFunction); err != nil {
 		return fmt.Errorf("could not sync connection pooler: %v", err)
+	}
+
+	// Major version upgrade must only run after success of all earlier operations, must remain last item in sync
+	if err := c.majorVersionUpgrade(); err != nil {
+		c.logger.Errorf("major version upgrade failed: %v", err)
 	}
 
 	return err
@@ -269,45 +262,30 @@ func (c *Cluster) syncPodDisruptionBudget(isUpdate bool) error {
 	return nil
 }
 
-func (c *Cluster) mustUpdatePodsAfterLazyUpdate(desiredSset *appsv1.StatefulSet) (bool, error) {
+func (c *Cluster) syncStatefulSet() error {
+	var (
+		masterPod               *v1.Pod
+		postgresConfig          map[string]interface{}
+		instanceRestartRequired bool
+	)
+
+	podsToRecreate := make([]v1.Pod, 0)
+	switchoverCandidates := make([]spec.NamespacedName, 0)
 
 	pods, err := c.listPods()
 	if err != nil {
-		return false, fmt.Errorf("could not list pods of the statefulset: %v", err)
+		c.logger.Warnf("could not list pods of the statefulset: %v", err)
 	}
 
-	for _, pod := range pods {
-
-		effectivePodImage := pod.Spec.Containers[0].Image
-		ssImage := desiredSset.Spec.Template.Spec.Containers[0].Image
-
-		if ssImage != effectivePodImage {
-			c.logger.Infof("not all pods were re-started when the lazy upgrade was enabled; forcing the rolling upgrade now")
-			return true, nil
-		}
-
-	}
-
-	return false, nil
-}
-
-func (c *Cluster) syncStatefulSet() error {
-	var (
-		podsRollingUpdateRequired bool
-	)
 	// NB: Be careful to consider the codepath that acts on podsRollingUpdateRequired before returning early.
 	sset, err := c.KubeClient.StatefulSets(c.Namespace).Get(context.TODO(), c.statefulSetName(), metav1.GetOptions{})
 	if err != nil {
 		if !k8sutil.ResourceNotFound(err) {
-			return fmt.Errorf("could not get statefulset: %v", err)
+			return fmt.Errorf("error during reading of statefulset: %v", err)
 		}
 		// statefulset does not exist, try to re-create it
 		c.Statefulset = nil
-		c.logger.Infof("could not find the cluster's statefulset")
-		pods, err := c.listPods()
-		if err != nil {
-			return fmt.Errorf("could not list pods of the statefulset: %v", err)
-		}
+		c.logger.Infof("cluster's statefulset does not exist")
 
 		sset, err = c.createStatefulSet()
 		if err != nil {
@@ -318,106 +296,181 @@ func (c *Cluster) syncStatefulSet() error {
 			return fmt.Errorf("cluster is not ready: %v", err)
 		}
 
-		podsRollingUpdateRequired = (len(pods) > 0)
-		if podsRollingUpdateRequired {
-			c.logger.Warningf("found pods from the previous statefulset: trigger rolling update")
-			if err := c.applyRollingUpdateFlagforStatefulSet(podsRollingUpdateRequired); err != nil {
-				return fmt.Errorf("could not set rolling update flag for the statefulset: %v", err)
+		if len(pods) > 0 {
+			for _, pod := range pods {
+				if err = c.markRollingUpdateFlagForPod(&pod, "pod from previous statefulset"); err != nil {
+					c.logger.Warnf("marking old pod for rolling update failed: %v", err)
+				}
+				podsToRecreate = append(podsToRecreate, pod)
 			}
 		}
 		c.logger.Infof("created missing statefulset %q", util.NameFromMeta(sset.ObjectMeta))
 
 	} else {
-		podsRollingUpdateRequired = c.mergeRollingUpdateFlagUsingCache(sset)
+		// check if there are still pods with a rolling update flag
+		for _, pod := range pods {
+			if c.getRollingUpdateFlagFromPod(&pod) {
+				podsToRecreate = append(podsToRecreate, pod)
+			} else {
+				role := PostgresRole(pod.Labels[c.OpConfig.PodRoleLabel])
+				if role == Master {
+					continue
+				}
+				switchoverCandidates = append(switchoverCandidates, util.NameFromMeta(pod.ObjectMeta))
+			}
+		}
+
+		if len(podsToRecreate) > 0 {
+			c.logger.Debugf("%d / %d pod(s) still need to be rotated", len(podsToRecreate), len(pods))
+		}
+
 		// statefulset is already there, make sure we use its definition in order to compare with the spec.
 		c.Statefulset = sset
 
-		// check if there is no Postgres version mismatch
-		for _, container := range c.Statefulset.Spec.Template.Spec.Containers {
-			if container.Name != "postgres" {
-				continue
-			}
-			pgVersion, err := c.getNewPgVersion(container, c.Spec.PostgresqlParam.PgVersion)
-			if err != nil {
-				return fmt.Errorf("could not parse current Postgres version: %v", err)
-			}
-			c.Spec.PostgresqlParam.PgVersion = pgVersion
-		}
-
-		desiredSS, err := c.generateStatefulSet(&c.Spec)
+		desiredSts, err := c.generateStatefulSet(&c.Spec)
 		if err != nil {
 			return fmt.Errorf("could not generate statefulset: %v", err)
 		}
-		c.setRollingUpdateFlagForStatefulSet(desiredSS, podsRollingUpdateRequired)
 
-		cmp := c.compareStatefulSetWith(desiredSS)
+		cmp := c.compareStatefulSetWith(desiredSts)
 		if !cmp.match {
-			if cmp.rollingUpdate && !podsRollingUpdateRequired {
-				podsRollingUpdateRequired = true
-				c.setRollingUpdateFlagForStatefulSet(desiredSS, podsRollingUpdateRequired)
+			if cmp.rollingUpdate {
+				podsToRecreate = make([]v1.Pod, 0)
+				switchoverCandidates = make([]spec.NamespacedName, 0)
+				for _, pod := range pods {
+					if err = c.markRollingUpdateFlagForPod(&pod, "pod changes"); err != nil {
+						return fmt.Errorf("updating rolling update flag for pod failed: %v", err)
+					}
+					podsToRecreate = append(podsToRecreate, pod)
+				}
 			}
 
-			c.logStatefulSetChanges(c.Statefulset, desiredSS, false, cmp.reasons)
+			c.logStatefulSetChanges(c.Statefulset, desiredSts, false, cmp.reasons)
 
 			if !cmp.replace {
-				if err := c.updateStatefulSet(desiredSS); err != nil {
+				if err := c.updateStatefulSet(desiredSts); err != nil {
 					return fmt.Errorf("could not update statefulset: %v", err)
 				}
 			} else {
-				if err := c.replaceStatefulSet(desiredSS); err != nil {
+				if err := c.replaceStatefulSet(desiredSts); err != nil {
 					return fmt.Errorf("could not replace statefulset: %v", err)
 				}
 			}
 		}
-		annotations := c.AnnotationsToPropagate(c.Statefulset.Annotations)
-		c.updateStatefulSetAnnotations(annotations)
 
-		if !podsRollingUpdateRequired && !c.OpConfig.EnableLazySpiloUpgrade {
-			// even if desired and actual statefulsets match
+		if len(podsToRecreate) == 0 && !c.OpConfig.EnableLazySpiloUpgrade {
+			// even if the desired and the running statefulsets match
 			// there still may be not up-to-date pods on condition
 			//  (a) the lazy update was just disabled
 			// and
 			//  (b) some of the pods were not restarted when the lazy update was still in place
-			podsRollingUpdateRequired, err = c.mustUpdatePodsAfterLazyUpdate(desiredSS)
-			if err != nil {
-				return fmt.Errorf("could not list pods of the statefulset: %v", err)
+			for _, pod := range pods {
+				effectivePodImage := getPostgresContainer(&pod.Spec).Image
+				stsImage := getPostgresContainer(&desiredSts.Spec.Template.Spec).Image
+
+				if stsImage != effectivePodImage {
+					if err = c.markRollingUpdateFlagForPod(&pod, "pod not yet restarted due to lazy update"); err != nil {
+						c.logger.Warnf("updating rolling update flag failed for pod %q: %v", pod.Name, err)
+					}
+					podsToRecreate = append(podsToRecreate, pod)
+				} else {
+					role := PostgresRole(pod.Labels[c.OpConfig.PodRoleLabel])
+					if role == Master {
+						continue
+					}
+					switchoverCandidates = append(switchoverCandidates, util.NameFromMeta(pod.ObjectMeta))
+				}
 			}
 		}
-
 	}
 
 	// Apply special PostgreSQL parameters that can only be set via the Patroni API.
 	// it is important to do it after the statefulset pods are there, but before the rolling update
 	// since those parameters require PostgreSQL restart.
-	if err := c.checkAndSetGlobalPostgreSQLConfiguration(); err != nil {
-		return fmt.Errorf("could not set cluster-wide PostgreSQL configuration options: %v", err)
+	pods, err = c.listPods()
+	if err != nil {
+		c.logger.Warnf("could not get list of pods to apply special PostgreSQL parameters only to be set via Patroni API: %v", err)
+	}
+
+	// get Postgres config, compare with manifest and update via Patroni PATCH endpoint if it differs
+	// Patroni's config endpoint is just a "proxy" to DCS. It is enough to patch it only once and it doesn't matter which pod is used.
+	for i, pod := range pods {
+		podName := util.NameFromMeta(pods[i].ObjectMeta)
+		config, err := c.patroni.GetConfig(&pod)
+		if err != nil {
+			c.logger.Warningf("could not get Postgres config from pod %s: %v", podName, err)
+			continue
+		}
+		instanceRestartRequired, err = c.checkAndSetGlobalPostgreSQLConfiguration(&pod, config)
+		if err != nil {
+			c.logger.Warningf("could not set PostgreSQL configuration options for pod %s: %v", podName, err)
+			continue
+		}
+		break
+	}
+
+	// if the config update requires a restart, call Patroni restart for replicas first, then master
+	if instanceRestartRequired {
+		c.logger.Debug("restarting Postgres server within pods")
+		ttl, ok := postgresConfig["ttl"].(int32)
+		if !ok {
+			ttl = 30
+		}
+		for i, pod := range pods {
+			role := PostgresRole(pod.Labels[c.OpConfig.PodRoleLabel])
+			if role == Master {
+				masterPod = &pods[i]
+				continue
+			}
+			c.restartInstance(&pod)
+			time.Sleep(time.Duration(ttl) * time.Second)
+		}
+
+		if masterPod != nil {
+			c.restartInstance(masterPod)
+		}
 	}
 
 	// if we get here we also need to re-create the pods (either leftovers from the old
 	// statefulset or those that got their configuration from the outdated statefulset)
-	if podsRollingUpdateRequired {
+	if len(podsToRecreate) > 0 {
 		c.logger.Debugln("performing rolling update")
 		c.eventRecorder.Event(c.GetReference(), v1.EventTypeNormal, "Update", "Performing rolling update")
-		if err := c.recreatePods(); err != nil {
+		if err := c.recreatePods(podsToRecreate, switchoverCandidates); err != nil {
 			return fmt.Errorf("could not recreate pods: %v", err)
 		}
-		c.logger.Infof("pods have been recreated")
 		c.eventRecorder.Event(c.GetReference(), v1.EventTypeNormal, "Update", "Rolling update done - pods have been recreated")
-		if err := c.applyRollingUpdateFlagforStatefulSet(false); err != nil {
-			c.logger.Warningf("could not clear rolling update for the statefulset: %v", err)
-		}
 	}
 	return nil
+}
+
+func (c *Cluster) restartInstance(pod *v1.Pod) {
+	podName := util.NameFromMeta(pod.ObjectMeta)
+	role := PostgresRole(pod.Labels[c.OpConfig.PodRoleLabel])
+
+	c.eventRecorder.Event(c.GetReference(), v1.EventTypeNormal, "Update", fmt.Sprintf("restarting Postgres server within %s pod %s", role, pod.Name))
+
+	if err := c.patroni.Restart(pod); err != nil {
+		c.logger.Warningf("could not restart Postgres server within %s pod %s: %v", role, podName, err)
+		return
+	}
+
+	c.logger.Debugf("Postgres server successfuly restarted in %s pod %s", role, podName)
+	c.eventRecorder.Event(c.GetReference(), v1.EventTypeNormal, "Update", fmt.Sprintf("Postgres server restart done for %s pod %s", role, pod.Name))
 }
 
 // AnnotationsToPropagate get the annotations to update if required
 // based on the annotations in postgres CRD
 func (c *Cluster) AnnotationsToPropagate(annotations map[string]string) map[string]string {
-	toPropagateAnnotations := c.OpConfig.DownscalerAnnotations
-	pgCRDAnnotations := c.Postgresql.ObjectMeta.GetAnnotations()
 
-	if toPropagateAnnotations != nil && pgCRDAnnotations != nil {
-		for _, anno := range toPropagateAnnotations {
+	if annotations == nil {
+		annotations = make(map[string]string)
+	}
+
+	pgCRDAnnotations := c.ObjectMeta.Annotations
+
+	if pgCRDAnnotations != nil {
+		for _, anno := range c.OpConfig.DownscalerAnnotations {
 			for k, v := range pgCRDAnnotations {
 				matched, err := regexp.MatchString(anno, k)
 				if err != nil {
@@ -431,50 +484,85 @@ func (c *Cluster) AnnotationsToPropagate(annotations map[string]string) map[stri
 		}
 	}
 
-	return annotations
+	if len(annotations) > 0 {
+		return annotations
+	}
+
+	return nil
 }
 
 // checkAndSetGlobalPostgreSQLConfiguration checks whether cluster-wide API parameters
-// (like max_connections) has changed and if necessary sets it via the Patroni API
-func (c *Cluster) checkAndSetGlobalPostgreSQLConfiguration() error {
-	var (
-		err  error
-		pods []v1.Pod
-	)
+// (like max_connections) have changed and if necessary sets it via the Patroni API
+func (c *Cluster) checkAndSetGlobalPostgreSQLConfiguration(pod *v1.Pod, patroniConfig map[string]interface{}) (bool, error) {
+	configToSet := make(map[string]interface{})
+	parametersToSet := make(map[string]string)
+	effectivePgParameters := make(map[string]interface{})
 
-	// we need to extract those options from the cluster manifest.
-	optionsToSet := make(map[string]string)
-	pgOptions := c.Spec.Parameters
+	// read effective Patroni config if set
+	if patroniConfig != nil {
+		effectivePostgresql := patroniConfig["postgresql"].(map[string]interface{})
+		effectivePgParameters = effectivePostgresql[patroniPGParametersParameterName].(map[string]interface{})
+	}
 
-	for k, v := range pgOptions {
-		if isBootstrapOnlyParameter(k) {
-			optionsToSet[k] = v
+	// compare parameters under postgresql section with c.Spec.Postgresql.Parameters from manifest
+	desiredPgParameters := c.Spec.Parameters
+	for desiredOption, desiredValue := range desiredPgParameters {
+		effectiveValue := effectivePgParameters[desiredOption]
+		if isBootstrapOnlyParameter(desiredOption) && (effectiveValue != desiredValue) {
+			parametersToSet[desiredOption] = desiredValue
 		}
 	}
 
-	if len(optionsToSet) == 0 {
-		return nil
+	if len(parametersToSet) > 0 {
+		configToSet["postgresql"] = map[string]interface{}{patroniPGParametersParameterName: parametersToSet}
 	}
 
-	if pods, err = c.listPods(); err != nil {
-		return err
+	// compare other options from config with c.Spec.Patroni from manifest
+	desiredPatroniConfig := c.Spec.Patroni
+	if desiredPatroniConfig.LoopWait > 0 && desiredPatroniConfig.LoopWait != uint32(patroniConfig["loop_wait"].(float64)) {
+		configToSet["loop_wait"] = desiredPatroniConfig.LoopWait
 	}
-	if len(pods) == 0 {
-		return fmt.Errorf("could not call Patroni API: cluster has no pods")
+	if desiredPatroniConfig.MaximumLagOnFailover > 0 && desiredPatroniConfig.MaximumLagOnFailover != float32(patroniConfig["maximum_lag_on_failover"].(float64)) {
+		configToSet["maximum_lag_on_failover"] = desiredPatroniConfig.MaximumLagOnFailover
 	}
+	if desiredPatroniConfig.PgHba != nil && !reflect.DeepEqual(desiredPatroniConfig.PgHba, (patroniConfig["pg_hba"])) {
+		configToSet["pg_hba"] = desiredPatroniConfig.PgHba
+	}
+	if desiredPatroniConfig.RetryTimeout > 0 && desiredPatroniConfig.RetryTimeout != uint32(patroniConfig["retry_timeout"].(float64)) {
+		configToSet["retry_timeout"] = desiredPatroniConfig.RetryTimeout
+	}
+	if desiredPatroniConfig.Slots != nil && !reflect.DeepEqual(desiredPatroniConfig.Slots, patroniConfig["slots"]) {
+		configToSet["slots"] = desiredPatroniConfig.Slots
+	}
+	if desiredPatroniConfig.SynchronousMode != patroniConfig["synchronous_mode"] {
+		configToSet["synchronous_mode"] = desiredPatroniConfig.SynchronousMode
+	}
+	if desiredPatroniConfig.SynchronousModeStrict != patroniConfig["synchronous_mode_strict"] {
+		configToSet["synchronous_mode_strict"] = desiredPatroniConfig.SynchronousModeStrict
+	}
+	if desiredPatroniConfig.TTL > 0 && desiredPatroniConfig.TTL != uint32(patroniConfig["ttl"].(float64)) {
+		configToSet["ttl"] = desiredPatroniConfig.TTL
+	}
+
+	if len(configToSet) == 0 {
+		return false, nil
+	}
+
+	configToSetJson, err := json.Marshal(configToSet)
+	if err != nil {
+		c.logger.Debugf("could not convert config patch to JSON: %v", err)
+	}
+
 	// try all pods until the first one that is successful, as it doesn't matter which pod
 	// carries the request to change configuration through
-	for _, pod := range pods {
-		podName := util.NameFromMeta(pod.ObjectMeta)
-		c.logger.Debugf("calling Patroni API on a pod %s to set the following Postgres options: %v",
-			podName, optionsToSet)
-		if err = c.patroni.SetPostgresParameters(&pod, optionsToSet); err == nil {
-			return nil
-		}
-		c.logger.Warningf("could not patch postgres parameters with a pod %s: %v", podName, err)
+	podName := util.NameFromMeta(pod.ObjectMeta)
+	c.logger.Debugf("patching Postgres config via Patroni API on pod %s with following options: %s",
+		podName, configToSetJson)
+	if err = c.patroni.SetConfig(pod, configToSet); err != nil {
+		return true, fmt.Errorf("could not patch postgres parameters with a pod %s: %v", podName, err)
 	}
-	return fmt.Errorf("could not reach Patroni API to set Postgres options: failed on every pod (%d total)",
-		len(pods))
+
+	return true, nil
 }
 
 func (c *Cluster) syncSecrets() error {
@@ -482,13 +570,14 @@ func (c *Cluster) syncSecrets() error {
 		err    error
 		secret *v1.Secret
 	)
+	c.logger.Info("syncing secrets")
 	c.setProcessName("syncing secrets")
 	secrets := c.generateUserSecrets()
 
 	for secretUsername, secretSpec := range secrets {
 		if secret, err = c.KubeClient.Secrets(secretSpec.Namespace).Create(context.TODO(), secretSpec, metav1.CreateOptions{}); err == nil {
 			c.Secrets[secret.UID] = secret
-			c.logger.Debugf("created new secret %q, uid: %q", util.NameFromMeta(secret.ObjectMeta), secret.UID)
+			c.logger.Debugf("created new secret %s, namespace: %s, uid: %s", util.NameFromMeta(secret.ObjectMeta), secretSpec.Namespace, secret.UID)
 			continue
 		}
 		if k8sutil.ResourceAlreadyExists(err) {
@@ -497,10 +586,11 @@ func (c *Cluster) syncSecrets() error {
 				return fmt.Errorf("could not get current secret: %v", err)
 			}
 			if secretUsername != string(secret.Data["username"]) {
-				c.logger.Warningf("secret %q does not contain the role %q", secretSpec.Name, secretUsername)
+				c.logger.Errorf("secret %s does not contain the role %s", secretSpec.Name, secretUsername)
 				continue
 			}
-			c.logger.Debugf("secret %q already exists, fetching its password", util.NameFromMeta(secret.ObjectMeta))
+			c.Secrets[secret.UID] = secret
+			c.logger.Debugf("secret %s already exists, fetching its password", util.NameFromMeta(secret.ObjectMeta))
 			if secretUsername == c.systemUsers[constants.SuperuserKeyName].Name {
 				secretUsername = constants.SuperuserKeyName
 				userMap = c.systemUsers
@@ -515,7 +605,7 @@ func (c *Cluster) syncSecrets() error {
 			if pwdUser.Password != string(secret.Data["password"]) &&
 				pwdUser.Origin == spec.RoleOriginInfrastructure {
 
-				c.logger.Debugf("updating the secret %q from the infrastructure roles", secretSpec.Name)
+				c.logger.Debugf("updating the secret %s from the infrastructure roles", secretSpec.Name)
 				if _, err = c.KubeClient.Secrets(secretSpec.Namespace).Update(context.TODO(), secretSpec, metav1.UpdateOptions{}); err != nil {
 					return fmt.Errorf("could not update infrastructure role secret for role %q: %v", secretUsername, err)
 				}
@@ -525,7 +615,7 @@ func (c *Cluster) syncSecrets() error {
 				userMap[secretUsername] = pwdUser
 			}
 		} else {
-			return fmt.Errorf("could not create secret for user %q: %v", secretUsername, err)
+			return fmt.Errorf("could not create secret for user %s: in namespace %s: %v", secretUsername, secretSpec.Namespace, err)
 		}
 	}
 
@@ -555,11 +645,31 @@ func (c *Cluster) syncRoles() (err error) {
 		}
 	}()
 
+	// mapping between original role name and with deletion suffix
+	deletedUsers := map[string]string{}
+
+	// create list of database roles to query
 	for _, u := range c.pgUsers {
-		userNames = append(userNames, u.Name)
+		pgRole := u.Name
+		userNames = append(userNames, pgRole)
+		// add team member role name with rename suffix in case we need to rename it back
+		if u.Origin == spec.RoleOriginTeamsAPI && c.OpConfig.EnableTeamMemberDeprecation {
+			deletedUsers[pgRole+c.OpConfig.RoleDeletionSuffix] = pgRole
+			userNames = append(userNames, pgRole+c.OpConfig.RoleDeletionSuffix)
+		}
 	}
 
-	if c.needConnectionPooler() {
+	// add team members that exist only in cache
+	// to trigger a rename of the role in ProduceSyncRequests
+	for _, cachedUser := range c.pgUsersCache {
+		if _, exists := c.pgUsers[cachedUser.Name]; !exists {
+			userNames = append(userNames, cachedUser.Name)
+		}
+	}
+
+	// add pooler user to list of pgUsers, too
+	// to check if the pooler user exists or has to be created
+	if needMasterConnectionPooler(&c.Spec) || needReplicaConnectionPooler(&c.Spec) {
 		connectionPoolerUser := c.systemUsers[constants.ConnectionPoolerUserKeyName]
 		userNames = append(userNames, connectionPoolerUser.Name)
 
@@ -573,51 +683,20 @@ func (c *Cluster) syncRoles() (err error) {
 		return fmt.Errorf("error getting users from the database: %v", err)
 	}
 
+	// update pgUsers where a deleted role was found
+	// so that they are skipped in ProduceSyncRequests
+	for _, dbUser := range dbUsers {
+		if originalUser, exists := deletedUsers[dbUser.Name]; exists {
+			recreatedUser := c.pgUsers[originalUser]
+			recreatedUser.Deleted = true
+			c.pgUsers[originalUser] = recreatedUser
+		}
+	}
+
 	pgSyncRequests := c.userSyncStrategy.ProduceSyncRequests(dbUsers, c.pgUsers)
 	if err = c.userSyncStrategy.ExecuteSyncRequests(pgSyncRequests, c.pgDb); err != nil {
 		return fmt.Errorf("error executing sync statements: %v", err)
 	}
-
-	return nil
-}
-
-// syncVolumeClaims reads all persistent volume claims and checks that their size matches the one declared in the statefulset.
-func (c *Cluster) syncVolumeClaims() error {
-	c.setProcessName("syncing volume claims")
-
-	act, err := c.volumeClaimsNeedResizing(c.Spec.Volume)
-	if err != nil {
-		return fmt.Errorf("could not compare size of the volume claims: %v", err)
-	}
-	if !act {
-		c.logger.Infof("volume claims don't require changes")
-		return nil
-	}
-	if err := c.resizeVolumeClaims(c.Spec.Volume); err != nil {
-		return fmt.Errorf("could not sync volume claims: %v", err)
-	}
-
-	c.logger.Infof("volume claims have been synced successfully")
-
-	return nil
-}
-
-// syncVolumes reads all persistent volumes and checks that their size matches the one declared in the statefulset.
-func (c *Cluster) syncVolumes() error {
-	c.setProcessName("syncing volumes")
-
-	act, err := c.volumesNeedResizing(c.Spec.Volume)
-	if err != nil {
-		return fmt.Errorf("could not compare size of the volumes: %v", err)
-	}
-	if !act {
-		return nil
-	}
-	if err := c.resizeVolumes(c.Spec.Volume, []volumes.VolumeResizer{&volumes.EBSVolumeResizer{AWSRegion: c.OpConfig.AWSRegion}}); err != nil {
-		return fmt.Errorf("could not sync volumes: %v", err)
-	}
-
-	c.logger.Infof("volumes have been synced successfully")
 
 	return nil
 }
@@ -679,10 +758,25 @@ func (c *Cluster) syncDatabases() error {
 		}
 	}
 
+	if len(createDatabases) > 0 {
+		// trigger creation of pooler objects in new database in syncConnectionPooler
+		if c.ConnectionPooler != nil {
+			for _, role := range [2]PostgresRole{Master, Replica} {
+				c.ConnectionPooler[role].LookupFunction = false
+			}
+		}
+	}
+
 	// set default privileges for prepared database
 	for _, preparedDatabase := range preparedDatabases {
-		if err = c.execAlterGlobalDefaultPrivileges(preparedDatabase+constants.OwnerRoleNameSuffix, preparedDatabase); err != nil {
-			return err
+		if err := c.initDbConnWithName(preparedDatabase); err != nil {
+			return fmt.Errorf("could not init database connection to %s", preparedDatabase)
+		}
+
+		for _, owner := range c.getOwnerRoles(preparedDatabase, c.Spec.PreparedDatabases[preparedDatabase].DefaultUsers) {
+			if err = c.execAlterGlobalDefaultPrivileges(owner, preparedDatabase); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -695,12 +789,8 @@ func (c *Cluster) syncPreparedDatabases() error {
 		if err := c.initDbConnWithName(preparedDbName); err != nil {
 			return fmt.Errorf("could not init connection to database %s: %v", preparedDbName, err)
 		}
-		defer func() {
-			if err := c.closeDbConn(); err != nil {
-				c.logger.Errorf("could not close database connection: %v", err)
-			}
-		}()
 
+		c.logger.Debugf("syncing prepared database %q", preparedDbName)
 		// now, prepare defined schemas
 		preparedSchemas := preparedDB.PreparedSchemas
 		if len(preparedDB.PreparedSchemas) == 0 {
@@ -713,6 +803,10 @@ func (c *Cluster) syncPreparedDatabases() error {
 		// install extensions
 		if err := c.syncExtensions(preparedDB.Extensions); err != nil {
 			return err
+		}
+
+		if err := c.closeDbConn(); err != nil {
+			c.logger.Errorf("could not close database connection: %v", err)
 		}
 	}
 
@@ -803,7 +897,7 @@ func (c *Cluster) syncLogicalBackupJob() error {
 			return fmt.Errorf("could not generate the desired logical backup job state: %v", err)
 		}
 		if match, reason := k8sutil.SameLogicalBackupJob(job, desiredJob); !match {
-			c.logger.Infof("logical job %q is not in the desired state and needs to be updated",
+			c.logger.Infof("logical job %s is not in the desired state and needs to be updated",
 				c.getLogicalBackupJobName(),
 			)
 			if reason != "" {
@@ -824,209 +918,16 @@ func (c *Cluster) syncLogicalBackupJob() error {
 	c.logger.Info("could not find the cluster's logical backup job")
 
 	if err = c.createLogicalBackupJob(); err == nil {
-		c.logger.Infof("created missing logical backup job %q", jobName)
+		c.logger.Infof("created missing logical backup job %s", jobName)
 	} else {
 		if !k8sutil.ResourceAlreadyExists(err) {
 			return fmt.Errorf("could not create missing logical backup job: %v", err)
 		}
-		c.logger.Infof("logical backup job %q already exists", jobName)
+		c.logger.Infof("logical backup job %s already exists", jobName)
 		if _, err = c.KubeClient.CronJobsGetter.CronJobs(c.Namespace).Get(context.TODO(), jobName, metav1.GetOptions{}); err != nil {
 			return fmt.Errorf("could not fetch existing logical backup job: %v", err)
 		}
 	}
 
 	return nil
-}
-
-func (c *Cluster) syncConnectionPooler(oldSpec,
-	newSpec *acidv1.Postgresql,
-	lookup InstallFunction) (SyncReason, error) {
-
-	var reason SyncReason
-	var err error
-
-	if c.ConnectionPooler == nil {
-		c.ConnectionPooler = &ConnectionPoolerObjects{}
-	}
-
-	newNeedConnectionPooler := c.needConnectionPoolerWorker(&newSpec.Spec)
-	oldNeedConnectionPooler := c.needConnectionPoolerWorker(&oldSpec.Spec)
-
-	if newNeedConnectionPooler {
-		// Try to sync in any case. If we didn't needed connection pooler before,
-		// it means we want to create it. If it was already present, still sync
-		// since it could happen that there is no difference in specs, and all
-		// the resources are remembered, but the deployment was manually deleted
-		// in between
-		c.logger.Debug("syncing connection pooler")
-
-		// in this case also do not forget to install lookup function as for
-		// creating cluster
-		if !oldNeedConnectionPooler || !c.ConnectionPooler.LookupFunction {
-			newConnectionPooler := newSpec.Spec.ConnectionPooler
-
-			specSchema := ""
-			specUser := ""
-
-			if newConnectionPooler != nil {
-				specSchema = newConnectionPooler.Schema
-				specUser = newConnectionPooler.User
-			}
-
-			schema := util.Coalesce(
-				specSchema,
-				c.OpConfig.ConnectionPooler.Schema)
-
-			user := util.Coalesce(
-				specUser,
-				c.OpConfig.ConnectionPooler.User)
-
-			if err = lookup(schema, user); err != nil {
-				return NoSync, err
-			}
-		}
-
-		if reason, err = c.syncConnectionPoolerWorker(oldSpec, newSpec); err != nil {
-			c.logger.Errorf("could not sync connection pooler: %v", err)
-			return reason, err
-		}
-	}
-
-	if oldNeedConnectionPooler && !newNeedConnectionPooler {
-		// delete and cleanup resources
-		if err = c.deleteConnectionPooler(); err != nil {
-			c.logger.Warningf("could not remove connection pooler: %v", err)
-		}
-	}
-
-	if !oldNeedConnectionPooler && !newNeedConnectionPooler {
-		// delete and cleanup resources if not empty
-		if c.ConnectionPooler != nil &&
-			(c.ConnectionPooler.Deployment != nil ||
-				c.ConnectionPooler.Service != nil) {
-
-			if err = c.deleteConnectionPooler(); err != nil {
-				c.logger.Warningf("could not remove connection pooler: %v", err)
-			}
-		}
-	}
-
-	return reason, nil
-}
-
-// Synchronize connection pooler resources. Effectively we're interested only in
-// synchronizing the corresponding deployment, but in case of deployment or
-// service is missing, create it. After checking, also remember an object for
-// the future references.
-func (c *Cluster) syncConnectionPoolerWorker(oldSpec, newSpec *acidv1.Postgresql) (
-	SyncReason, error) {
-
-	deployment, err := c.KubeClient.
-		Deployments(c.Namespace).
-		Get(context.TODO(), c.connectionPoolerName(), metav1.GetOptions{})
-
-	if err != nil && k8sutil.ResourceNotFound(err) {
-		msg := "Deployment %s for connection pooler synchronization is not found, create it"
-		c.logger.Warningf(msg, c.connectionPoolerName())
-
-		deploymentSpec, err := c.generateConnectionPoolerDeployment(&newSpec.Spec)
-		if err != nil {
-			msg = "could not generate deployment for connection pooler: %v"
-			return NoSync, fmt.Errorf(msg, err)
-		}
-
-		deployment, err := c.KubeClient.
-			Deployments(deploymentSpec.Namespace).
-			Create(context.TODO(), deploymentSpec, metav1.CreateOptions{})
-
-		if err != nil {
-			return NoSync, err
-		}
-
-		c.ConnectionPooler.Deployment = deployment
-	} else if err != nil {
-		msg := "could not get connection pooler deployment to sync: %v"
-		return NoSync, fmt.Errorf(msg, err)
-	} else {
-		c.ConnectionPooler.Deployment = deployment
-
-		// actual synchronization
-		oldConnectionPooler := oldSpec.Spec.ConnectionPooler
-		newConnectionPooler := newSpec.Spec.ConnectionPooler
-
-		// sync implementation below assumes that both old and new specs are
-		// not nil, but it can happen. To avoid any confusion like updating a
-		// deployment because the specification changed from nil to an empty
-		// struct (that was initialized somewhere before) replace any nil with
-		// an empty spec.
-		if oldConnectionPooler == nil {
-			oldConnectionPooler = &acidv1.ConnectionPooler{}
-		}
-
-		if newConnectionPooler == nil {
-			newConnectionPooler = &acidv1.ConnectionPooler{}
-		}
-
-		c.logger.Infof("Old: %+v, New %+v", oldConnectionPooler, newConnectionPooler)
-
-		specSync, specReason := c.needSyncConnectionPoolerSpecs(oldConnectionPooler, newConnectionPooler)
-		defaultsSync, defaultsReason := c.needSyncConnectionPoolerDefaults(newConnectionPooler, deployment)
-		reason := append(specReason, defaultsReason...)
-		if specSync || defaultsSync {
-			c.logger.Infof("Update connection pooler deployment %s, reason: %+v",
-				c.connectionPoolerName(), reason)
-
-			newDeploymentSpec, err := c.generateConnectionPoolerDeployment(&newSpec.Spec)
-			if err != nil {
-				msg := "could not generate deployment for connection pooler: %v"
-				return reason, fmt.Errorf(msg, err)
-			}
-
-			oldDeploymentSpec := c.ConnectionPooler.Deployment
-
-			deployment, err := c.updateConnectionPoolerDeployment(
-				oldDeploymentSpec,
-				newDeploymentSpec)
-
-			if err != nil {
-				return reason, err
-			}
-
-			c.ConnectionPooler.Deployment = deployment
-			return reason, nil
-		}
-	}
-
-	newAnnotations := c.AnnotationsToPropagate(c.ConnectionPooler.Deployment.Annotations)
-	if newAnnotations != nil {
-		c.updateConnectionPoolerAnnotations(newAnnotations)
-	}
-
-	service, err := c.KubeClient.
-		Services(c.Namespace).
-		Get(context.TODO(), c.connectionPoolerName(), metav1.GetOptions{})
-
-	if err != nil && k8sutil.ResourceNotFound(err) {
-		msg := "Service %s for connection pooler synchronization is not found, create it"
-		c.logger.Warningf(msg, c.connectionPoolerName())
-
-		serviceSpec := c.generateConnectionPoolerService(&newSpec.Spec)
-		service, err := c.KubeClient.
-			Services(serviceSpec.Namespace).
-			Create(context.TODO(), serviceSpec, metav1.CreateOptions{})
-
-		if err != nil {
-			return NoSync, err
-		}
-
-		c.ConnectionPooler.Service = service
-	} else if err != nil {
-		msg := "could not get connection pooler service to sync: %v"
-		return NoSync, fmt.Errorf(msg, err)
-	} else {
-		// Service updates are not supported and probably not that useful anyway
-		c.ConnectionPooler.Service = service
-	}
-
-	return NoSync, nil
 }

@@ -14,7 +14,7 @@ For setting a full development environment, follow the steps below.
 
 Postgres Operator is written in Go. Use the [installation instructions](https://golang.org/doc/install#install)
 if you don't have Go on your system. You won't be able to compile the operator
-with Go older than 1.7. We recommend installing [the latest one](https://golang.org/dl/).
+with Go older than 1.15. We recommend installing [the latest one](https://golang.org/dl/).
 
 Go projects expect their source code and all the dependencies to be located
 under the [GOPATH](https://github.com/golang/go/wiki/GOPATH). Normally, one
@@ -242,11 +242,31 @@ Then you can for example check the Patroni logs:
 kubectl logs acid-minimal-cluster-0
 ```
 
+## Unit tests with Mocks and K8s Fake API
+
+Whenever possible you should rely on leveraging proper mocks and K8s fake client that allows full fledged testing of K8s objects in your unit tests.
+
+To enable mocks, a code annotation is needed:
+[Mock code gen annotation](https://github.com/zalando/postgres-operator/blob/master/pkg/util/volumes/volumes.go#L3)
+
+To generate mocks run:
+```bash
+make mocks
+```
+
+Examples for mocks can be found in:
+[Example mock usage](https://github.com/zalando/postgres-operator/blob/master/pkg/cluster/volumes_test.go#L248)
+
+Examples for fake K8s objects can be found in:
+[Example fake K8s client usage](https://github.com/zalando/postgres-operator/blob/master/pkg/cluster/volumes_test.go#L166)
+
 ## End-to-end tests
 
-The operator provides reference end-to-end tests (e2e) (as Docker image) to
-ensure various infrastructure parts work smoothly together. Each e2e execution
-tests a Postgres Operator image built from the current git branch. The test
+The operator provides reference end-to-end (e2e) tests to
+ensure various infrastructure parts work smoothly together. The test code is available at `e2e/tests`.
+The special `registry.opensource.zalan.do/acid/postgres-operator-e2e-tests-runner` image is used to run the tests. The container mounts the local `e2e/tests` directory at runtime, so whatever you modify in your local copy of the tests will be executed by a test runner. By maintaining a separate test runner image we avoid the need to re-build the e2e test image on every build. 
+
+Each e2e execution tests a Postgres Operator image built from the current git branch. The test
 runner creates a new local K8s cluster using [kind](https://kind.sigs.k8s.io/),
 utilizes provided manifest examples, and runs e2e tests contained in the `tests`
 folder. The K8s API client in the container connects to the `kind` cluster via
@@ -291,7 +311,7 @@ manifest files:
 
 Postgres manifest parameters are defined in the [api package](../pkg/apis/acid.zalan.do/v1/postgresql_type.go).
 The operator behavior has to be implemented at least in [k8sres.go](../pkg/cluster/k8sres.go).
-Validation of CRD parameters is controlled in [crd.go](../pkg/apis/acid.zalan.do/v1/crds.go).
+Validation of CRD parameters is controlled in [crds.go](../pkg/apis/acid.zalan.do/v1/crds.go).
 Please, reflect your changes in tests, for example in:
 * [config_test.go](../pkg/util/config/config_test.go)
 * [k8sres_test.go](../pkg/cluster/k8sres_test.go)
@@ -301,13 +321,12 @@ Please, reflect your changes in tests, for example in:
 
 For the CRD-based configuration, please update the following files:
 * the default [OperatorConfiguration](../manifests/postgresql-operator-default-configuration.yaml)
-* the Helm chart's [values-crd file](../charts/postgres-operator/values.yaml)
 * the CRD's [validation](../manifests/operatorconfiguration.crd.yaml)
+* the CRD's validation in the [Helm chart](../charts/postgres-operator/crds/operatorconfigurations.yaml)
 
-Reflect the changes in the ConfigMap configuration as well (note that numeric
-and boolean parameters have to use double quotes here):
-* [ConfigMap](../manifests/configmap.yaml) manifest
-* the Helm chart's default [values file](../charts/postgres-operator/values.yaml)
+Add new options also to the Helm chart's [values file](../charts/postgres-operator/values.yaml) file.
+It follows the OperatorConfiguration CRD layout. Nested values will be flattened for the ConfigMap.
+Last but no least, update the [ConfigMap](../manifests/configmap.yaml) manifest example as well.
 
 ### Updating documentation
 

@@ -11,10 +11,10 @@ solutions:
 
 * [minikube](https://github.com/kubernetes/minikube/releases), which creates a
   single-node K8s cluster inside a VM (requires KVM or VirtualBox),
-* [kind](https://kind.sigs.k8s.io/), which allows creating multi-nodes K8s
+* [kind](https://kind.sigs.k8s.io/) and [k3d](https://k3d.io), which allows creating multi-nodes K8s
   clusters running on Docker (requires Docker)
 
-To interact with the K8s infrastructure install it's CLI runtime [kubectl](https://kubernetes.io/docs/tasks/tools/install-kubectl/#install-kubectl-binary-via-curl).
+To interact with the K8s infrastructure install its CLI runtime [kubectl](https://kubernetes.io/docs/tasks/tools/install-kubectl/#install-kubectl-binary-via-curl).
 
 This quickstart assumes that you have started minikube or created a local kind
 cluster. Note that you can also use built-in K8s support in the Docker Desktop
@@ -34,8 +34,8 @@ Postgres cluster. This can work in two ways: via a ConfigMap or a custom
 The Postgres Operator can be deployed in the following ways:
 
 * Manual deployment
+* Kustomization
 * Helm chart
-* Operator Lifecycle Manager (OLM)
 
 ### Manual deployment setup
 
@@ -81,29 +81,11 @@ the repo root. With Helm v3 installed you should be able to run:
 helm install postgres-operator ./charts/postgres-operator
 ```
 
-To use CRD-based configuration you need to specify the [values-crd yaml file](../charts/postgres-operator/values-crd.yaml).
-
-```bash
-helm install postgres-operator ./charts/postgres-operator -f ./charts/postgres-operator/values-crd.yaml
-```
-
 The chart works with both Helm 2 and Helm 3. The `crd-install` hook from v2 will
 be skipped with warning when using v3. Documentation for installing applications
 with Helm 2 can be found in the [v2 docs](https://v2.helm.sh/docs/).
 
-### Operator Lifecycle Manager (OLM)
-
-The [Operator Lifecycle Manager (OLM)](https://github.com/operator-framework/operator-lifecycle-manager)
-has been designed to facilitate management of K8s operators. It has to be
-installed in your K8s environment. When OLM is set up simply download and deploy
-the Postgres Operator with the following command:
-
-```bash
-kubectl create -f https://operatorhub.io/install/postgres-operator.yaml
-```
-
-This installs the operator in the `operators` namespace. More information can be
-found on [operatorhub.io](https://operatorhub.io/operator/postgres-operator).
+The chart is also hosted at: https://opensource.zalando.com/postgres-operator/charts/postgres-operator/
 
 ## Check if Postgres Operator is running
 
@@ -142,6 +124,9 @@ To deploy the UI simply apply all its manifests files or use the UI helm chart:
 # manual deployment
 kubectl apply -f ui/manifests/
 
+# or kustomization
+kubectl apply -k github.com/zalando/postgres-operator/ui/manifests
+
 # or helm chart
 helm install postgres-operator-ui ./charts/postgres-operator-ui
 ```
@@ -160,7 +145,7 @@ You can now access the web interface by port forwarding the UI pod (mind the
 label selector) and enter `localhost:8081` in your browser:
 
 ```bash
-kubectl port-forward svc/postgres-operator-ui 8081:8081
+kubectl port-forward svc/postgres-operator-ui 8081:80
 ```
 
 Available option are explained in detail in the [UI docs](operator-ui.md).

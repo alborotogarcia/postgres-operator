@@ -65,6 +65,20 @@ These parameters are grouped directly under  the `spec` key in the manifest.
   custom Docker image that overrides the **docker_image** operator parameter.
   It should be a [Spilo](https://github.com/zalando/spilo) image. Optional.
 
+* **schedulerName**
+  specifies the scheduling profile for database pods. If no value is provided
+  K8s' `default-scheduler` will be used. Optional.
+
+* **spiloRunAsUser**
+  sets the user ID which should be used in the container to run the process.
+  This must be set to run the container without root. By default the container
+  runs with root. This option only works for Spilo versions >= 1.6-p3.
+
+* **spiloRunAsGroup**
+  sets the group ID which should be used in the container to run the process.
+  This must be set to run the container without root. By default the container
+  runs with root. This option only works for Spilo versions >= 1.6-p3.
+
 * **spiloFSGroup**
   the Persistent Volumes for the Spilo pods in the StatefulSet will be owned and
   writable by the group ID specified. This will override the **spilo_fsgroup**
@@ -95,7 +109,11 @@ These parameters are grouped directly under  the `spec` key in the manifest.
   `SUPERUSER`, `REPLICATION`, `INHERIT`, `LOGIN`, `NOLOGIN`, `CREATEROLE`,
   `CREATEDB`, `BYPASSURL`. A login user is created by default unless NOLOGIN is
   specified, in which case the operator creates a role. One can specify empty
-  flags by providing a JSON empty array '*[]*'. Optional.
+  flags by providing a JSON empty array '*[]*'. If the config option
+  `enable_cross_namespace_secrets` is enabled you can specify the namespace in
+  the user name in the form `{namespace}.{username}` and the operator will
+  create the K8s secret in that namespace. The part after the first `.` is
+  considered to be the user name. Optional.
 
 * **databases**
   a map of database names to database owners for the databases that should be
@@ -141,9 +159,14 @@ These parameters are grouped directly under  the `spec` key in the manifest.
   configured (so you can override the operator configuration). Optional.
 
 * **enableConnectionPooler**
-  Tells the operator to create a connection pooler with a database. If this
-  field is true, a connection pooler deployment will be created even if
+  Tells the operator to create a connection pooler with a database for the master
+  service. If this field is true, a connection pooler deployment will be created even if
   `connectionPooler` section is empty. Optional, not set by default.
+
+* **enableReplicaConnectionPooler**
+  Tells the operator to create a connection pooler with a database for the replica
+  service. If this field is true, a connection pooler deployment for replica
+  will be created even if `connectionPooler` section is empty. Optional, not set by default.
 
 * **enableLogicalBackup**
   Determines if the logical backup of this cluster should be taken and uploaded
@@ -165,6 +188,35 @@ These parameters are grouped directly under  the `spec` key in the manifest.
   If `targetContainers` is empty, additional volumes will be mounted only in the `postgres` container.
   If you set the `all` special item, it will be mounted in all containers (postgres + sidecars).
   Else you can set the list of target containers in which the additional volumes will be mounted (eg : postgres, telegraf)
+
+## Prepared Databases
+
+The operator can create databases with default owner, reader and writer roles
+without the need to specifiy them under `users` or `databases` sections. Those
+parameters are grouped under the `preparedDatabases` top-level key. For more
+information, see [user docs](../user.md#prepared-databases-with-roles-and-default-privileges).
+
+* **defaultUsers**
+  The operator will always create default `NOLOGIN` roles for defined prepared
+  databases, but if `defaultUsers` is set to `true` three additional `LOGIN`
+  roles with `_user` suffix will get created. Default is `false`.
+
+* **extensions**
+  map of extensions with target database schema that the operator will install
+  in the database. Optional.
+
+* **schemas**
+  map of schemas that the operator will create. Optional - if no schema is
+  listed, the operator will create a schema called `data`. Under each schema
+  key, it can be defined if `defaultRoles` (NOLOGIN) and `defaultUsers` (LOGIN)
+  roles shall be created that have schema-exclusive privileges. Both flags are
+  set to `false` by default.
+
+* **secretNamespace**
+  for each default LOGIN role the operator will create a secret. You can
+  specify the namespace in which these secrets will get created, if
+  `enable_cross_namespace_secrets` is set to `true` in the config. Otherwise,
+  the cluster namespace is used.
 
 ## Postgres parameters
 
@@ -231,15 +283,17 @@ explanation of `ttl` and `loop_wait` parameters.
 
 * **synchronous_mode**
   Patroni `synchronous_mode` parameter value. The default is set to `false`. Optional.
-  
+
 * **synchronous_mode_strict**
   Patroni `synchronous_mode_strict` parameter value. Can be used in addition to `synchronous_mode`. The default is set to `false`. Optional.
-  
+
 ## Postgres container resources
 
 Those parameters define [CPU and memory requests and limits](https://kubernetes.io/docs/concepts/configuration/manage-compute-resources-container/)
 for the Postgres container. They are grouped under the `resources` top-level
-key with subgroups `requests` and `limits`.
+key with subgroups `requests` and `limits`. The whole section is optional,
+however if you specify a request or limit you have to define everything
+(unless you are not modifying the default CRD schema validation). 
 
 ### Requests
 
@@ -247,11 +301,11 @@ CPU and memory requests for the Postgres container.
 
 * **cpu**
   CPU requests for the Postgres container. Optional, overrides the
-  `default_cpu_requests` operator configuration parameter. Optional.
+  `default_cpu_requests` operator configuration parameter.
 
 * **memory**
   memory requests for the Postgres container. Optional, overrides the
-  `default_memory_request` operator configuration parameter. Optional.
+  `default_memory_request` operator configuration parameter.
 
 ### Limits
 
@@ -259,11 +313,11 @@ CPU and memory limits for the Postgres container.
 
 * **cpu**
   CPU limits for the Postgres container. Optional, overrides the
-  `default_cpu_limits` operator configuration parameter. Optional.
+  `default_cpu_limits` operator configuration parameter.
 
 * **memory**
   memory limits for the Postgres container. Optional, overrides the
-  `default_memory_limits` operator configuration parameter. Optional.
+  `default_memory_limits` operator configuration parameter.
 
 ## Parameters defining how to clone the cluster from another one
 
@@ -319,13 +373,13 @@ archive is supported.
   the url to S3 bucket containing the WAL archive of the remote primary.
   Required when the `standby` section is present.
 
-## EBS volume resizing
+## Volume properties
 
 Those parameters are grouped under the `volume` top-level key and define the
 properties of the persistent storage that stores Postgres data.
 
 * **size**
-  the size of the target EBS volume. Usual Kubernetes size modifiers, i.e. `Gi`
+  the size of the target volume. Usual Kubernetes size modifiers, i.e. `Gi`
   or `Mi`, apply. Required.
 
 * **storageClass**
@@ -336,6 +390,19 @@ properties of the persistent storage that stores Postgres data.
 
 * **subPath**
   Subpath to use when mounting volume into Spilo container. Optional.
+
+* **iops**
+  When running the operator on AWS the latest generation of EBS volumes (`gp3`)
+  allows for configuring the number of IOPS. Maximum is 16000. Optional.
+
+* **throughput**
+  When running the operator on AWS the latest generation of EBS volumes (`gp3`)
+  allows for configuring the throughput in MB/s. Maximum is 1000. Optional.
+
+* **selector**
+  A label query over PVs to consider for binding. See the [Kubernetes 
+  documentation](https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/)
+  for details on using `matchLabels` and `matchExpressions`. Optional
 
 ## Sidecar definitions
 
@@ -387,8 +454,10 @@ CPU and memory limits for the sidecar container.
 
 Parameters are grouped under the `connectionPooler` top-level key and specify
 configuration for connection pooler. If this section is not empty, a connection
-pooler will be created for a database even if `enableConnectionPooler` is not
-present.
+pooler will be created for master service only even if `enableConnectionPooler`
+is not present. But if this section is present then it defines the configuration
+for both master and replica pooler services (if `enableReplicaConnectionPooler`
+ is enabled).
 
 * **numberOfInstances**
   How many instances of connection pooler to create.

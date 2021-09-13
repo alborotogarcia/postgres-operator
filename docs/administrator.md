@@ -3,6 +3,21 @@
 Learn how to configure and manage the Postgres Operator in your Kubernetes (K8s)
 environment.
 
+## Upgrading the operator
+
+The Postgres Operator is upgraded by changing the docker image within the
+deployment. Before doing so, it is recommended to check the release notes
+for new configuration options or changed behavior you might want to reflect
+in the ConfigMap or config CRD. E.g. a new feature might get introduced which
+is enabled or disabled by default and you want to change it to the opposite
+with the corresponding flag option.
+
+When using helm, be aware that installing the new chart will not update the
+`Postgresql` and `OperatorConfiguration` CRD. Make sure to update them before
+with the provided manifests in the `crds` folder. Otherwise, you might face
+errors about new Postgres manifest or configuration options being unknown
+to the CRD schema validation.
+
 ## Minor and major version upgrade
 
 Minor version upgrades for PostgreSQL are handled via updating the Spilo Docker
@@ -11,17 +26,42 @@ switchover (planned failover) of the master to the Pod with new minor version.
 The switch should usually take less than 5 seconds, still clients have to
 reconnect.
 
-Major version upgrades are supported via [cloning](user.md#how-to-clone-an-existing-postgresql-cluster).
-The new cluster manifest must have a higher `version` string than the source
-cluster and will be created from a basebackup. Depending of the cluster size,
-downtime in this case can be significant as writes to the database should be
-stopped and all WAL files should be archived first before cloning is started.
+### Upgrade on cloning
 
-Note, that simply changing the version string in the `postgresql` manifest does
-not work at present and leads to errors. Neither Patroni nor Postgres Operator
-can do in place `pg_upgrade`. Still, it can be executed manually in the Postgres
-container, which is tricky (i.e. systems need to be stopped, replicas have to be
-synced) but of course faster than cloning.
+With [cloning](user.md#how-to-clone-an-existing-postgresql-cluster), the new
+cluster manifest must have a higher `version` string than the source cluster
+and will be created from a basebackup. Depending of the cluster size, downtime
+in this case can be significant as writes to the database should be stopped
+and all WAL files should be archived first before cloning is started.
+Therefore, use cloning only to test major version upgrades and check for
+compatibility of your app with to Postgres server of a higher version.
+
+### In-place major version upgrade
+
+Starting with Spilo 13, Postgres Operator can run an in-place major version
+upgrade which is much faster than cloning. First, you need to make sure, that
+the `PGVERSION` environment variable is set for the database pods. Since
+`v1.6.0` the related option `enable_pgversion_env_var` is enabled by default.
+
+In-place major version upgrades can be configured to be executed by the
+operator with the `major_version_upgrade_mode` option. By default it is set
+to `off` which means the cluster version will not change when increased in
+the manifest. Still, a rolling update would be triggered updating the
+`PGVERSION` variable. But Spilo's [`configure_spilo`](https://github.com/zalando/spilo/blob/master/postgres-appliance/scripts/configure_spilo.py)
+script will notice the version mismatch and start the old version again.
+
+In this scenario the major version could then be run by a user from within the
+master pod. Exec into the container and run:
+```bash
+python3 /scripts/inplace_upgrade.py N
+```
+where `N` is the number of members of your cluster (see [`numberOfInstances`](https://github.com/zalando/postgres-operator/blob/50cb5898ea715a1db7e634de928b2d16dc8cd969/manifests/minimal-postgres-manifest.yaml#L10)).
+The upgrade is usually fast, well under one minute for most DBs. Note, that
+changes become irrevertible once `pg_upgrade` is called. To understand the
+upgrade procedure, refer to the [corresponding PR in Spilo](https://github.com/zalando/spilo/pull/488).
+
+When `major_version_upgrade_mode` is set to `manual` the operator will run
+the upgrade script for you after the manifest is updated and pods are rotated.
 
 ## CRD Validation
 
@@ -44,7 +84,7 @@ Once the validation is enabled it can only be disabled manually by editing or
 patching the CRD manifest:
 
 ```bash
-zk8 patch crd postgresqls.acid.zalan.do -p '{"spec":{"validation": null}}'
+kubectl patch crd postgresqls.acid.zalan.do -p '{"spec":{"validation": null}}'
 ```
 
 ## Non-default cluster domain
@@ -122,6 +162,97 @@ spec:
 Every other Postgres cluster which lacks the annotation will be ignored by this
 operator. Conversely, operators without a defined `CONTROLLER_ID` will ignore
 clusters with defined ownership of another operator.
+
+## Understanding rolling update of Spilo pods
+
+The operator logs reasons for a rolling update with the `info` level and a diff
+between the old and new StatefulSet specs with the `debug` level. To benefit
+from numerous escape characters in the latter log entry, view it in CLI with
+`echo -e`. Note that the resultant message will contain some noise because the
+`PodTemplate` used by the operator is yet to be updated with the default values
+used internally in K8s.
+
+The StatefulSet is replaced if the following properties change:
+- annotations
+- volumeClaimTemplates
+- template volumes
+
+The StatefulSet is replaced and a rolling updates is triggered if the following
+properties differ between the old and new state:
+- container name, ports, image, resources, env, envFrom, securityContext and volumeMounts
+- template labels, annotations, service account, securityContext, affinity, priority class and termination grace period
+
+Note that, changes in `SPILO_CONFIGURATION` env variable under `bootstrap.dcs`
+path are ignored for the diff. They will be applied through Patroni's rest api
+interface, following a restart of all instances.
+
+The operator also support lazy updates of the Spilo image. In this case the
+StatefulSet is only updated, but no rolling update follows. This feature saves
+you a switchover - and hence downtime - when you know pods are re-started later
+anyway, for instance due to the node rotation. To force a rolling update,
+disable this mode by setting the `enable_lazy_spilo_upgrade` to `false` in the
+operator configuration and restart the operator pod.
+
+## Delete protection via annotations
+
+To avoid accidental deletes of Postgres clusters the operator can check the
+manifest for two existing annotations containing the cluster name and/or the
+current date (in YYYY-MM-DD format). The name of the annotation keys can be
+defined in the configuration. By default, they are not set which disables the
+delete protection. Thus, one could choose to only go with one annotation.
+
+**postgres-operator ConfigMap**
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-operator
+data:
+  delete_annotation_date_key: "delete-date"
+  delete_annotation_name_key: "delete-clustername"
+```
+
+**OperatorConfiguration**
+
+```yaml
+apiVersion: "acid.zalan.do/v1"
+kind: OperatorConfiguration
+metadata:
+  name: postgresql-operator-configuration
+configuration:
+  kubernetes:
+    delete_annotation_date_key: "delete-date"
+    delete_annotation_name_key: "delete-clustername"
+```
+
+Now, every cluster manifest must contain the configured annotation keys to
+trigger the delete process when running `kubectl delete pg`. Note, that the
+`Postgresql` resource would still get deleted as K8s' API server does not
+block it. Only the operator logs will tell, that the delete criteria wasn't
+met.
+
+**cluster manifest**
+
+```yaml
+apiVersion: "acid.zalan.do/v1"
+kind: postgresql
+metadata:
+  name: demo-cluster
+  annotations:
+    delete-date: "2020-08-31"
+    delete-clustername: "demo-cluster"
+spec:
+  ...
+```
+
+In case, the resource has been deleted accidentally or the annotations were
+simply forgotten, it's safe to recreate the cluster with `kubectl create`.
+Existing Postgres cluster are not replaced by the operator. But, as the
+original cluster still exists the status will show `CreateFailed` at first.
+On the next sync event it should change to `Running`. However, as it is in
+fact a new resource for K8s, the UID will differ which can trigger a rolling
+update of the pods because the UID is used as part of backup path to S3.
 
 ## Role-based access control for the operator
 
@@ -320,13 +451,23 @@ spec:
 
 ## Custom Pod Environment Variables
 
-It is possible to configure a ConfigMap which is used by the Postgres pods as
-an additional provider for environment variables. One use case is to customize
-the Spilo image and configure it with environment variables. The ConfigMap with
-the additional settings is referenced in the operator's main configuration.
-A namespace can be specified along with the name. If left out, the configured
-default namespace of your K8s client will be used and if the ConfigMap is not
-found there, the Postgres cluster's namespace is taken when different:
+It is possible to configure a ConfigMap as well as a Secret which are used by
+the Postgres pods as an additional provider for environment variables. One use
+case is a customized Spilo image configured by extra environment variables.
+Another case could be to provide custom cloud provider or backup settings.
+
+In general the Operator will give preference to the globally configured
+variables, to not have the custom ones interfere with core functionality.
+Variables with the 'WAL_' and 'LOG_' prefix can be overwritten though, to
+allow backup and log shipping to be specified differently.
+
+### Via ConfigMap
+
+The ConfigMap with the additional settings is referenced in the operator's
+main configuration. A namespace can be specified along with the name. If left
+out, the configured default namespace of your K8s client will be used and if
+the ConfigMap is not found there, the Postgres cluster's namespace is taken
+when different:
 
 **postgres-operator ConfigMap**
 
@@ -365,8 +506,55 @@ data:
   MY_CUSTOM_VAR: value
 ```
 
-This ConfigMap is then added as a source of environment variables to the
-Postgres StatefulSet/pods.
+The key-value pairs of the ConfigMap are then added as environment variables
+to the Postgres StatefulSet/pods.
+
+### Via Secret
+
+The Secret with the additional variables is referenced in the operator's main
+configuration. To protect the values of the secret from being exposed in the
+pod spec they are each referenced as SecretKeyRef. This does not allow for the
+secret to be in a different namespace as the pods though
+
+**postgres-operator ConfigMap**
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-operator
+data:
+  # referencing secret with custom environment variables
+  pod_environment_secret: postgres-pod-secrets
+```
+
+**OperatorConfiguration**
+
+```yaml
+apiVersion: "acid.zalan.do/v1"
+kind: OperatorConfiguration
+metadata:
+  name: postgresql-operator-configuration
+configuration:
+  kubernetes:
+    # referencing secret with custom environment variables
+    pod_environment_secret: postgres-pod-secrets
+```
+
+**referenced Secret `postgres-pod-secrets`**
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-pod-secrets
+  namespace: default
+data:
+  MY_CUSTOM_VAR: dmFsdWU=
+```
+
+The key-value pairs of the Secret are all accessible as environment variables
+to the Postgres StatefulSet/pods.
 
 ## Limiting the number of min and max instances in clusters
 
@@ -375,8 +563,8 @@ instances permitted by each Postgres cluster managed by the operator. If either
 `min_instances` or `max_instances` is set to a non-zero value, the operator may
 adjust the number of instances specified in the cluster manifest to match
 either the min or the max boundary. For instance, of a cluster manifest has 1
-instance and the `min_instances` is set to 3, the cluster will be created with 3
-instances. By default, both parameters are set to `-1`.
+instance and the `min_instances` is set to 3, the cluster will be created with
+3 instances. By default, both parameters are set to `-1`.
 
 ## Load balancers and allowed IP ranges
 
@@ -445,61 +633,11 @@ database.
 * **Human users** originate from the [Teams API](user.md#teams-api-roles) that
 returns a list of the team members given a team id. The operator differentiates
 between (a) product teams that own a particular Postgres cluster and are granted
-admin rights to maintain it, and (b) Postgres superuser teams that get the
-superuser access to all Postgres databases running in a K8s cluster for the
-purposes of maintaining and troubleshooting.
-
-## Understanding rolling update of Spilo pods
-
-The operator logs reasons for a rolling update with the `info` level and a diff
-between the old and new StatefulSet specs with the `debug` level. To benefit
-from numerous escape characters in the latter log entry, view it in CLI with
-`echo -e`. Note that the resultant message will contain some noise because the
-`PodTemplate` used by the operator is yet to be updated with the default values
-used internally in K8s.
-
-The operator also support lazy updates of the Spilo image. That means the pod
-template of a PG cluster's stateful set is updated immediately with the new
-image, but no rolling update follows. This feature saves you a switchover - and
-hence downtime - when you know pods are re-started later anyway, for instance
-due to the node rotation. To force a rolling update, disable this mode by
-setting the `enable_lazy_spilo_upgrade` to `false` in the operator configuration
-and restart the operator pod. With the standard eager rolling updates the
-operator checks during Sync all pods run images specified in their respective
-statefulsets. The operator triggers a rolling upgrade for PG clusters that
-violate this condition.
-
-## Logical backups
-
-The operator can manage K8s cron jobs to run logical backups of Postgres
-clusters. The cron job periodically spawns a batch job that runs a single pod.
-The backup script within this pod's container can connect to a DB for a logical
-backup. The operator updates cron jobs during Sync if the job schedule changes;
-the job name acts as the job identifier. These jobs are to be enabled for each
-individual Postgres cluster by setting `enableLogicalBackup: true` in its
-manifest. Notes:
-
-1. The [example image](../docker/logical-backup/Dockerfile) implements the
-backup via `pg_dumpall` and upload of compressed and encrypted results to an S3
-bucket; the default image ``registry.opensource.zalan.do/acid/logical-backup``
-is the same image built with the Zalando-internal CI pipeline. `pg_dumpall`
-requires a `superuser` access to a DB and runs on the replica when possible.
-
-2. Due to the [limitation of K8s cron jobs](https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/#cron-job-limitations)
-it is highly advisable to set up additional monitoring for this feature; such
-monitoring is outside of the scope of operator responsibilities.
-
-3. The operator does not remove old backups.
-
-4. You may use your own image by overwriting the relevant field in the operator
-configuration. Any such image must ensure the logical backup is able to finish
-[in presence of pod restarts](https://kubernetes.io/docs/concepts/workloads/controllers/jobs-run-to-completion/#handling-pod-and-container-failures)
-and [simultaneous invocations](https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/#cron-job-limitations)
-of the backup cron job.
-
-5. For that feature to work, your RBAC policy must enable operations on the
-`cronjobs` resource from the `batch` API group for the operator service account.
-See [example RBAC](../manifests/operator-service-account-rbac.yaml)
+admin rights to maintain it, (b) Postgres superuser teams that get superuser
+access to all Postgres databases running in a K8s cluster for the purposes of
+maintaining and troubleshooting, and (c) additional teams, superuser teams or
+members associated with the owning team. The latter is managed via the
+[PostgresTeam CRD](user.md#additional-teams-and-members-per-cluster).
 
 ## Access to cloud resources from clusters in non-cloud environment
 
@@ -518,26 +656,140 @@ A secret can be pre-provisioned in different ways:
 * Automatically provisioned via a custom K8s controller like
   [kube-aws-iam-controller](https://github.com/mikkeloscar/kube-aws-iam-controller)
 
-## Google Cloud Platform setup
+## WAL archiving and physical basebackups
 
-To configure the operator on GCP there are some prerequisites that are needed:
+Spilo is shipped with [WAL-E](https://github.com/wal-e/wal-e) and its successor
+[WAL-G](https://github.com/wal-g/wal-g) to perform WAL archiving. By default,
+WAL-E is used for backups because it is more battle-tested. In addition to the
+continuous backup stream WAL-E/G pushes a physical base backup every night and
+01:00 am UTC.
+
+These are the pre-configured settings in the docker image:
+```bash
+BACKUP_NUM_TO_RETAIN: 5
+BACKUP_SCHEDULE:      '00 01 * * *'
+USE_WALG_BACKUP:      false (true for Azure and SSH)
+USE_WALG_RESTORE:     false (true for S3, Azure and SSH)
+```
+
+Within Postgres you can check the pre-configured commands for archiving and
+restoring WAL files. You can find the log files to the respective commands
+under `$HOME/pgdata/pgroot/pg_log/postgres-?.log`.
+
+```bash
+archive_command:  `envdir "{WALE_ENV_DIR}" {WALE_BINARY} wal-push "%p"`
+restore_command:  `envdir "{{WALE_ENV_DIR}}" /scripts/restore_command.sh "%f" "%p"`
+```
+
+You can produce a basebackup manually with the following command and check
+if it ends up in your specified WAL backup path:
+
+```bash
+envdir "/run/etc/wal-e.d/env" /scripts/postgres_backup.sh "/home/postgres/pgdata/pgroot/data"
+```
+
+You can also check if Spilo is able to find any backups:
+
+```bash
+envdir "/run/etc/wal-e.d/env" wal-g backup-list
+```
+
+Depending on the cloud storage provider different [environment variables](https://github.com/zalando/spilo/blob/master/ENVIRONMENT.rst)
+have to be set for Spilo. Not all of them are generated automatically by the
+operator by changing its configuration. In this case you have to use an
+[extra configmap or secret](#custom-pod-environment-variables).
+
+### Using AWS S3 or compliant services
+
+When using AWS you have to reference the S3 backup path, the IAM role and the
+AWS region in the configuration.
+
+**postgres-operator ConfigMap**
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-operator
+data:
+  aws_region: eu-central-1
+  kube_iam_role: postgres-pod-role
+  wal_s3_bucket: your-backup-path
+```
+
+**OperatorConfiguration**
+
+```yaml
+apiVersion: "acid.zalan.do/v1"
+kind: OperatorConfiguration
+metadata:
+  name: postgresql-operator-configuration
+configuration:
+  aws_or_gcp:
+    aws_region: eu-central-1
+    kube_iam_role: postgres-pod-role
+    wal_s3_bucket: your-backup-path
+```
+
+The referenced IAM role should contain the following privileges to make sure
+Postgres can send compressed WAL files to the given S3 bucket:
+
+```yaml
+  PostgresPodRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: "postgres-pod-role"
+      Path: "/"
+      Policies:
+        - PolicyName: "SpiloS3Access"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Action: "s3:*"
+                Effect: "Allow"
+                Resource:
+                  - "arn:aws:s3:::your-backup-path"
+                  - "arn:aws:s3:::your-backup-path/*"
+```
+
+This should produce the following settings for the essential environment
+variables:
+
+```bash
+AWS_ENDPOINT='https://s3.eu-central-1.amazonaws.com:443'
+WALE_S3_ENDPOINT='https+path://s3.eu-central-1.amazonaws.com:443'
+WALE_S3_PREFIX=$WAL_S3_BUCKET/spilo/{WAL_BUCKET_SCOPE_PREFIX}{SCOPE}{WAL_BUCKET_SCOPE_SUFFIX}/wal/{PGVERSION}
+```
+
+The operator sets the prefix to an empty string so that spilo will generate it
+from the configured `WAL_S3_BUCKET`. 
+
+:warning: When you overwrite the configuration by defining `WAL_S3_BUCKET` in
+the [pod_environment_configmap](#custom-pod-environment-variables) you have
+to set `WAL_BUCKET_SCOPE_PREFIX = ""`, too. Otherwise Spilo will not find
+the physical backups on restore (next chapter).
+
+When the `AWS_REGION` is set, `AWS_ENDPOINT` and `WALE_S3_ENDPOINT` are
+generated automatically. `WALG_S3_PREFIX` is identical to `WALE_S3_PREFIX`.
+`SCOPE` is the Postgres cluster name.
+
+### Google Cloud Platform setup
+
+To configure the operator on GCP these prerequisites that are needed:
 
 * A service account with the proper IAM setup to access the GCS bucket for the WAL-E logs
 * The credentials file for the service account.
 
-The configuration paramaters that we will be using are:
+The configuration parameters that we will be using are:
 
 * `additional_secret_mount`
 * `additional_secret_mount_path`
 * `gcp_credentials`
 * `wal_gs_bucket`
 
-### Generate a K8 secret resource
-
-Generate the K8 secret resource that will contain your service account's 
+1. Generate the K8s secret resource that will contain your service account's
 credentials. It's highly recommended to use a service account and limit its
-scope to just the WAL-E bucket. 
-
+scope to just the WAL-E bucket.
 ```yaml
 apiVersion: v1
 kind: Secret
@@ -550,24 +802,189 @@ stringData:
     <GCP .json credentials>
 ```
 
-### Setup your operator configuration values
-
-With the `psql-wale-creds` resource applied to your cluster, ensure that
-the operator's configuration is set up like the following:
-
+2. Setup your operator configuration values. With the `psql-wale-creds`
+resource applied to your cluster, ensure that the operator's configuration
+is set up like the following:
 ```yml
 ...
 aws_or_gcp:
   additional_secret_mount: "pgsql-wale-creds"
-  additional_secret_mount_path: "/var/secrets/google" # or where ever you want to mount the file
+  additional_secret_mount_path: "/var/secrets/google"  # or where ever you want to mount the file
   # aws_region: eu-central-1
   # kube_iam_role: ""
   # log_s3_bucket: ""
   # wal_s3_bucket: ""
-  wal_gs_bucket: "postgres-backups-bucket-28302F2" # name of bucket on where to save the WAL-E logs
-  gcp_credentials: "/var/secrets/google/key.json" # combination of the mount path & key in the K8 resource. (i.e. key.json)
+  wal_gs_bucket: "postgres-backups-bucket-28302F2"  # name of bucket on where to save the WAL-E logs
+  gcp_credentials: "/var/secrets/google/key.json"  # combination of the mount path & key in the K8s resource. (i.e. key.json)
 ...
 ```
+
+3. Setup pod environment configmap that instructs the operator to use WAL-G,
+instead of WAL-E, for backup and restore.
+```yml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pod-env-overrides
+  namespace: postgres-operator-system
+data:
+  # Any env variable used by spilo can be added
+  USE_WALG_BACKUP: "true"
+  USE_WALG_RESTORE: "true"
+  CLONE_USE_WALG_RESTORE: "true"
+```
+
+4. Then provide this configmap in postgres-operator settings:
+```yml
+...
+# namespaced name of the ConfigMap with environment variables to populate on every pod
+pod_environment_configmap: "postgres-operator-system/pod-env-overrides"
+...
+```
+
+### Azure setup
+
+To configure the operator on Azure these prerequisites are needed:
+
+* A storage account in the same region as the Kubernetes cluster.
+
+The configuration parameters that we will be using are:
+
+* `pod_environment_secret`
+* `wal_az_storage_account`
+
+1. Generate the K8s secret resource that will contain your storage account's
+access key. You will need a copy of this secret in every namespace you want to
+create postgresql clusters.
+
+The latest version of WAL-G (v1.0) supports the use of a SASS token, but you'll
+have to make due with using the primary or secondary access token until the
+version of WAL-G is updated in the postgres-operator.
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: psql-backup-creds
+  namespace: default
+type: Opaque
+stringData:
+  AZURE_STORAGE_ACCESS_KEY: <primary or secondary access key>
+```
+
+2. Setup pod environment configmap that instructs the operator to use WAL-G,
+instead of WAL-E, for backup and restore.
+```yml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pod-env-overrides
+  namespace: postgres-operator-system
+data:
+  # Any env variable used by spilo can be added
+  USE_WALG_BACKUP: "true"
+  USE_WALG_RESTORE: "true"
+  CLONE_USE_WALG_RESTORE: "true"
+```
+
+3. Setup your operator configuration values. With the `psql-backup-creds`
+and `pod-env-overrides` resources applied to your cluster, ensure that the operator's configuration
+is set up like the following:
+```yml
+...
+aws_or_gcp:
+  pod_environment_secret: "pgsql-backup-creds"
+  pod_environment_configmap: "postgres-operator-system/pod-env-overrides"
+  wal_az_storage_account: "postgresbackupsbucket28302F2"  # name of storage account to save the WAL-G logs
+...
+```
+
+### Restoring physical backups
+
+If cluster members have to be (re)initialized restoring physical backups
+happens automatically either from the backup location or by running
+[pg_basebackup](https://www.postgresql.org/docs/13/app-pgbasebackup.html)
+on one of the other running instances (preferably replicas if they do not lag
+behind). You can test restoring backups by [cloning](user.md#how-to-clone-an-existing-postgresql-cluster)
+clusters.
+
+If you need to provide a [custom clone environment](#custom-pod-environment-variables)
+copy existing variables about your setup (backup location, prefix, access
+keys etc.) and prepend the `CLONE_` prefix to get them copied to the correct
+directory within Spilo.
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-pod-config
+data:
+  AWS_REGION: "eu-west-1"
+  AWS_ACCESS_KEY_ID: "****"
+  AWS_SECRET_ACCESS_KEY: "****"
+  ...
+  CLONE_AWS_REGION: "eu-west-1"
+  CLONE_AWS_ACCESS_KEY_ID: "****"
+  CLONE_AWS_SECRET_ACCESS_KEY: "****"
+  ...
+```
+
+### Standby clusters
+
+The setup for [standby clusters](user.md#setting-up-a-standby-cluster) is very
+similar to cloning. At the moment, the operator only allows for streaming from
+the S3 WAL archive of the master specified in the manifest. Like with cloning,
+if you are using [additional environment variables](#custom-pod-environment-variables)
+to access your backup location you have to copy those variables and prepend the
+`STANDBY_` prefix for Spilo to find the backups and WAL files to stream.
+
+## Logical backups
+
+The operator can manage K8s cron jobs to run logical backups (SQL dumps) of
+Postgres clusters. The cron job periodically spawns a batch job that runs a
+single pod. The backup script within this pod's container can connect to a DB
+for a logical backup. The operator updates cron jobs during Sync if the job
+schedule changes; the job name acts as the job identifier. These jobs are to
+be enabled for each individual Postgres cluster by updating the manifest:
+
+```yaml
+apiVersion: "acid.zalan.do/v1"
+kind: postgresql
+metadata:
+  name: demo-cluster
+spec:
+  enableLogicalBackup: true
+```
+
+There a few things to consider when using logical backups:
+
+1. Logical backups should not be seen as a proper alternative to basebackups
+and WAL archiving which are described above. At the moment, the operator cannot
+restore logical backups automatically and you do not get point-in-time recovery
+but only snapshots of your data. In its current state, see logical backups as a
+way to quickly create SQL dumps that you can easily restore in an empty test
+cluster.
+
+2. The [example image](../docker/logical-backup/Dockerfile) implements the backup
+via `pg_dumpall` and upload of compressed and encrypted results to an S3 bucket.
+`pg_dumpall` requires a `superuser` access to a DB and runs on the replica when
+possible.
+
+3. Due to the [limitation of K8s cron jobs](https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/#cron-job-limitations)
+it is highly advisable to set up additional monitoring for this feature; such
+monitoring is outside of the scope of operator responsibilities.
+
+4. The operator does not remove old backups.
+
+5. You may use your own image by overwriting the relevant field in the operator
+configuration. Any such image must ensure the logical backup is able to finish
+[in presence of pod restarts](https://kubernetes.io/docs/concepts/workloads/controllers/jobs-run-to-completion/#handling-pod-and-container-failures)
+and [simultaneous invocations](https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/#cron-job-limitations)
+of the backup cron job.
+
+6. For that feature to work, your RBAC policy must enable operations on the
+`cronjobs` resource from the `batch` API group for the operator service account.
+See [example RBAC](../manifests/operator-service-account-rbac.yaml)
 
 ## Sidecars for Postgres clusters
 
@@ -582,6 +999,7 @@ configuration:
     name: global-sidecar
     ports:
     - containerPort: 80
+      protocol: TCP
     volumeMounts:
     - mountPath: /custom-pgdata-mountpoint
       name: pgdata
@@ -657,7 +1075,7 @@ make docker
 
 # build in image in minikube docker env
 eval $(minikube docker-env)
-docker build -t registry.opensource.zalan.do/acid/postgres-operator-ui:v1.3.0 .
+docker build -t registry.opensource.zalan.do/acid/postgres-operator-ui:v1.7.0 .
 
 # apply UI manifests next to a running Postgres Operator
 kubectl apply -f manifests/

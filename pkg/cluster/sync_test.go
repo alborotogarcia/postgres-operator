@@ -1,261 +1,115 @@
 package cluster
 
 import (
-	"fmt"
-	"strings"
 	"testing"
+	"time"
 
+	"context"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/stretchr/testify/assert"
 	acidv1 "github.com/zalando/postgres-operator/pkg/apis/acid.zalan.do/v1"
+	fakeacidv1 "github.com/zalando/postgres-operator/pkg/generated/clientset/versioned/fake"
 	"github.com/zalando/postgres-operator/pkg/util/config"
 	"github.com/zalando/postgres-operator/pkg/util/k8sutil"
-
-	appsv1 "k8s.io/api/apps/v1"
-	v1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
 )
 
-func int32ToPointer(value int32) *int32 {
-	return &value
+func newFakeK8sSyncClient() (k8sutil.KubernetesClient, *fake.Clientset) {
+	acidClientSet := fakeacidv1.NewSimpleClientset()
+	clientSet := fake.NewSimpleClientset()
+
+	return k8sutil.KubernetesClient{
+		PodsGetter:         clientSet.CoreV1(),
+		PostgresqlsGetter:  acidClientSet.AcidV1(),
+		StatefulSetsGetter: clientSet.AppsV1(),
+	}, clientSet
 }
 
-func deploymentUpdated(cluster *Cluster, err error, reason SyncReason) error {
-	if cluster.ConnectionPooler.Deployment.Spec.Replicas == nil ||
-		*cluster.ConnectionPooler.Deployment.Spec.Replicas != 2 {
-		return fmt.Errorf("Wrong nubmer of instances")
+func TestSyncStatefulSetsAnnotations(t *testing.T) {
+	testName := "test syncing statefulsets annotations"
+	client, _ := newFakeK8sSyncClient()
+	clusterName := "acid-test-cluster"
+	namespace := "default"
+	inheritedAnnotation := "environment"
+
+	pg := acidv1.Postgresql{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        clusterName,
+			Namespace:   namespace,
+			Annotations: map[string]string{inheritedAnnotation: "test"},
+		},
+		Spec: acidv1.PostgresSpec{
+			Volume: acidv1.Volume{
+				Size: "1Gi",
+			},
+		},
 	}
 
-	return nil
-}
-
-func objectsAreSaved(cluster *Cluster, err error, reason SyncReason) error {
-	if cluster.ConnectionPooler == nil {
-		return fmt.Errorf("Connection pooler resources are empty")
-	}
-
-	if cluster.ConnectionPooler.Deployment == nil {
-		return fmt.Errorf("Deployment was not saved")
-	}
-
-	if cluster.ConnectionPooler.Service == nil {
-		return fmt.Errorf("Service was not saved")
-	}
-
-	return nil
-}
-
-func objectsAreDeleted(cluster *Cluster, err error, reason SyncReason) error {
-	if cluster.ConnectionPooler != nil {
-		return fmt.Errorf("Connection pooler was not deleted")
-	}
-
-	return nil
-}
-
-func noEmptySync(cluster *Cluster, err error, reason SyncReason) error {
-	for _, msg := range reason {
-		if strings.HasPrefix(msg, "update [] from '<nil>' to '") {
-			return fmt.Errorf("There is an empty reason, %s", msg)
-		}
-	}
-
-	return nil
-}
-
-func TestConnectionPoolerSynchronization(t *testing.T) {
-	testName := "Test connection pooler synchronization"
 	var cluster = New(
 		Config{
 			OpConfig: config.Config{
-				ProtectedRoles: []string{"admin"},
-				Auth: config.Auth{
-					SuperUsername:       superUserName,
-					ReplicationUsername: replicationUserName,
-				},
-				ConnectionPooler: config.ConnectionPooler{
-					ConnectionPoolerDefaultCPURequest:    "100m",
-					ConnectionPoolerDefaultCPULimit:      "100m",
-					ConnectionPoolerDefaultMemoryRequest: "100Mi",
-					ConnectionPoolerDefaultMemoryLimit:   "100Mi",
-					NumberOfInstances:                    int32ToPointer(1),
+				PodManagementPolicy: "ordered_ready",
+				Resources: config.Resources{
+					ClusterLabels:         map[string]string{"application": "spilo"},
+					ClusterNameLabel:      "cluster-name",
+					DefaultCPURequest:     "300m",
+					DefaultCPULimit:       "300m",
+					DefaultMemoryRequest:  "300Mi",
+					DefaultMemoryLimit:    "300Mi",
+					InheritedAnnotations:  []string{inheritedAnnotation},
+					PodRoleLabel:          "spilo-role",
+					ResourceCheckInterval: time.Duration(3),
+					ResourceCheckTimeout:  time.Duration(10),
 				},
 			},
-		}, k8sutil.KubernetesClient{}, acidv1.Postgresql{}, logger, eventRecorder)
+		}, client, pg, logger, eventRecorder)
 
-	cluster.Statefulset = &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "test-sts",
-		},
+	cluster.Name = clusterName
+	cluster.Namespace = namespace
+
+	// create a statefulset
+	_, err := cluster.createStatefulSet()
+	assert.NoError(t, err)
+
+	// patch statefulset and add annotation
+	patchData, err := metaAnnotationsPatch(map[string]string{"test-anno": "true"})
+	assert.NoError(t, err)
+
+	newSts, err := cluster.KubeClient.StatefulSets(namespace).Patch(
+		context.TODO(),
+		clusterName,
+		types.MergePatchType,
+		[]byte(patchData),
+		metav1.PatchOptions{},
+		"")
+	assert.NoError(t, err)
+
+	cluster.Statefulset = newSts
+
+	// first compare running with desired statefulset - they should not match
+	// because no inherited annotations or downscaler annotations are configured
+	desiredSts, err := cluster.generateStatefulSet(&cluster.Postgresql.Spec)
+	assert.NoError(t, err)
+
+	cmp := cluster.compareStatefulSetWith(desiredSts)
+	if cmp.match {
+		t.Errorf("%s: match between current and desired statefulsets albeit differences: %#v", testName, cmp)
 	}
 
-	clusterMissingObjects := *cluster
-	clusterMissingObjects.KubeClient = k8sutil.ClientMissingObjects()
+	// now sync statefulset - the diff will trigger a replacement of the statefulset
+	cluster.syncStatefulSet()
 
-	clusterMock := *cluster
-	clusterMock.KubeClient = k8sutil.NewMockKubernetesClient()
-
-	clusterDirtyMock := *cluster
-	clusterDirtyMock.KubeClient = k8sutil.NewMockKubernetesClient()
-	clusterDirtyMock.ConnectionPooler = &ConnectionPoolerObjects{
-		Deployment: &appsv1.Deployment{},
-		Service:    &v1.Service{},
+	// compare again after the SYNC - must be identical to the desired state
+	cmp = cluster.compareStatefulSetWith(desiredSts)
+	if !cmp.match {
+		t.Errorf("%s: current and desired statefulsets are not matching %#v", testName, cmp)
 	}
 
-	clusterNewDefaultsMock := *cluster
-	clusterNewDefaultsMock.KubeClient = k8sutil.NewMockKubernetesClient()
-
-	tests := []struct {
-		subTest          string
-		oldSpec          *acidv1.Postgresql
-		newSpec          *acidv1.Postgresql
-		cluster          *Cluster
-		defaultImage     string
-		defaultInstances int32
-		check            func(cluster *Cluster, err error, reason SyncReason) error
-	}{
-		{
-			subTest: "create if doesn't exist",
-			oldSpec: &acidv1.Postgresql{
-				Spec: acidv1.PostgresSpec{
-					ConnectionPooler: &acidv1.ConnectionPooler{},
-				},
-			},
-			newSpec: &acidv1.Postgresql{
-				Spec: acidv1.PostgresSpec{
-					ConnectionPooler: &acidv1.ConnectionPooler{},
-				},
-			},
-			cluster:          &clusterMissingObjects,
-			defaultImage:     "pooler:1.0",
-			defaultInstances: 1,
-			check:            objectsAreSaved,
-		},
-		{
-			subTest: "create if doesn't exist with a flag",
-			oldSpec: &acidv1.Postgresql{
-				Spec: acidv1.PostgresSpec{},
-			},
-			newSpec: &acidv1.Postgresql{
-				Spec: acidv1.PostgresSpec{
-					EnableConnectionPooler: boolToPointer(true),
-				},
-			},
-			cluster:          &clusterMissingObjects,
-			defaultImage:     "pooler:1.0",
-			defaultInstances: 1,
-			check:            objectsAreSaved,
-		},
-		{
-			subTest: "create from scratch",
-			oldSpec: &acidv1.Postgresql{
-				Spec: acidv1.PostgresSpec{},
-			},
-			newSpec: &acidv1.Postgresql{
-				Spec: acidv1.PostgresSpec{
-					ConnectionPooler: &acidv1.ConnectionPooler{},
-				},
-			},
-			cluster:          &clusterMissingObjects,
-			defaultImage:     "pooler:1.0",
-			defaultInstances: 1,
-			check:            objectsAreSaved,
-		},
-		{
-			subTest: "delete if not needed",
-			oldSpec: &acidv1.Postgresql{
-				Spec: acidv1.PostgresSpec{
-					ConnectionPooler: &acidv1.ConnectionPooler{},
-				},
-			},
-			newSpec: &acidv1.Postgresql{
-				Spec: acidv1.PostgresSpec{},
-			},
-			cluster:          &clusterMock,
-			defaultImage:     "pooler:1.0",
-			defaultInstances: 1,
-			check:            objectsAreDeleted,
-		},
-		{
-			subTest: "cleanup if still there",
-			oldSpec: &acidv1.Postgresql{
-				Spec: acidv1.PostgresSpec{},
-			},
-			newSpec: &acidv1.Postgresql{
-				Spec: acidv1.PostgresSpec{},
-			},
-			cluster:          &clusterDirtyMock,
-			defaultImage:     "pooler:1.0",
-			defaultInstances: 1,
-			check:            objectsAreDeleted,
-		},
-		{
-			subTest: "update deployment",
-			oldSpec: &acidv1.Postgresql{
-				Spec: acidv1.PostgresSpec{
-					ConnectionPooler: &acidv1.ConnectionPooler{
-						NumberOfInstances: int32ToPointer(1),
-					},
-				},
-			},
-			newSpec: &acidv1.Postgresql{
-				Spec: acidv1.PostgresSpec{
-					ConnectionPooler: &acidv1.ConnectionPooler{
-						NumberOfInstances: int32ToPointer(2),
-					},
-				},
-			},
-			cluster:          &clusterMock,
-			defaultImage:     "pooler:1.0",
-			defaultInstances: 1,
-			check:            deploymentUpdated,
-		},
-		{
-			subTest: "update image from changed defaults",
-			oldSpec: &acidv1.Postgresql{
-				Spec: acidv1.PostgresSpec{
-					ConnectionPooler: &acidv1.ConnectionPooler{},
-				},
-			},
-			newSpec: &acidv1.Postgresql{
-				Spec: acidv1.PostgresSpec{
-					ConnectionPooler: &acidv1.ConnectionPooler{},
-				},
-			},
-			cluster:          &clusterNewDefaultsMock,
-			defaultImage:     "pooler:2.0",
-			defaultInstances: 2,
-			check:            deploymentUpdated,
-		},
-		{
-			subTest: "there is no sync from nil to an empty spec",
-			oldSpec: &acidv1.Postgresql{
-				Spec: acidv1.PostgresSpec{
-					EnableConnectionPooler: boolToPointer(true),
-					ConnectionPooler:       nil,
-				},
-			},
-			newSpec: &acidv1.Postgresql{
-				Spec: acidv1.PostgresSpec{
-					EnableConnectionPooler: boolToPointer(true),
-					ConnectionPooler:       &acidv1.ConnectionPooler{},
-				},
-			},
-			cluster:          &clusterMock,
-			defaultImage:     "pooler:1.0",
-			defaultInstances: 1,
-			check:            noEmptySync,
-		},
-	}
-	for _, tt := range tests {
-		tt.cluster.OpConfig.ConnectionPooler.Image = tt.defaultImage
-		tt.cluster.OpConfig.ConnectionPooler.NumberOfInstances =
-			int32ToPointer(tt.defaultInstances)
-
-		reason, err := tt.cluster.syncConnectionPooler(tt.oldSpec,
-			tt.newSpec, mockInstallLookupFunction)
-
-		if err := tt.check(tt.cluster, err, reason); err != nil {
-			t.Errorf("%s [%s]: Could not synchronize, %+v",
-				testName, tt.subTest, err)
-		}
+	// check if inherited annotation exists
+	if _, exists := desiredSts.Annotations[inheritedAnnotation]; !exists {
+		t.Errorf("%s: inherited annotation not found in desired statefulset: %#v", testName, desiredSts.Annotations)
 	}
 }
