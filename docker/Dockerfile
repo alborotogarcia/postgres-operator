@@ -1,4 +1,4 @@
-FROM registry.opensource.zalan.do/library/alpine-3.12:latest
+FROM alpine:latest
 LABEL maintainer="Team ACID @ Zalando <team-acid@zalando.de>"
 
 # We need root certificates to deal with teams api over https
@@ -12,5 +12,5 @@ RUN adduser -D -u 1000 -G pgo -g 'Postgres Operator' pgo
 
 USER pgo:pgo
 
-# ENTRYPOINT ["/postgres-operator"]
+ENTRYPOINT ["/postgres-operator"]
 

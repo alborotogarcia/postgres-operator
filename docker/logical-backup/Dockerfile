@@ -1,4 +1,4 @@
-FROM registry.opensource.zalan.do/library/ubuntu-18.04:latest
+FROM docker.io/ubuntu:20.04
 LABEL maintainer="Team ACID @ Zalando <team-acid@zalando.de>"
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
