@@ -1,5 +1,4 @@
-# FROM registry.opensource.zalan.do/library/alpine-3.12:latest
-FROM alpine:latest
+FROM registry.opensource.zalan.do/library/alpine-3.12:latest
 LABEL maintainer="Team ACID @ Zalando <team-acid@zalando.de>"
 
 # We need root certificates to deal with teams api over https

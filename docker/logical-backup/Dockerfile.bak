@@ -1,4 +1,8 @@
+<<<<<<< HEAD
+FROM ubuntu:20.04
+=======
 FROM registry.opensource.zalan.do/library/ubuntu-18.04:latest
+>>>>>>> upstream/docker-base-images
 LABEL maintainer="Team ACID @ Zalando <team-acid@zalando.de>"
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
