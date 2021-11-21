@@ -4,8 +4,6 @@ metadata:
   name: postgresqls.acid.zalan.do
   labels:
     app.kubernetes.io/name: postgres-operator
-  annotations:
-    "helm.sh/hook": crd-install
 spec:
   group: acid.zalan.do
   names:
@@ -362,14 +360,13 @@ spec:
                   version:
                     type: string
                     enum:
-                      - "9.3"
-                      - "9.4"
                       - "9.5"
                       - "9.6"
                       - "10"
                       - "11"
                       - "12"
                       - "13"
+                      - "14"
                   parameters:
                     type: object
                     additionalProperties:
