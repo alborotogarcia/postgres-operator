@@ -1,4 +1,5 @@
-FROM registry.opensource.zalan.do/library/alpine-3.12:latest
+# FROM registry.opensource.zalan.do/library/alpine-3.12:latest
+FROM alpine:3.12 
 LABEL maintainer="Team ACID @ Zalando <team-acid@zalando.de>"
 
 EXPOSE 8081
@@ -17,20 +18,19 @@ RUN \
     && \
   python3 -m ensurepip && \
   rm -r /usr/lib/python*/ensurepip && \
-  pip3 install --upgrade \
+  pip3 install --no-cache-dir --upgrade \
     gevent \
     jq \
     pip \
     setuptools \
     && \
   rm -rf \
-    /root/.cache \
     /tmp/* \
     /var/cache/apk/*
 
 COPY requirements.txt /
 COPY start_server.sh /
-RUN pip3 install -r /requirements.txt
+RUN pip3 install --no-cache-dir -r /requirements.txt
 
 COPY operator_ui /operator_ui
 
