@@ -1,6 +1,7 @@
 .PHONY: clean test appjs docker push mock
 
-IMAGE            ?= registry.opensource.zalan.do/acid/postgres-operator-ui
+# IMAGE            ?= registry.opensource.zalan.do/acid/postgres-operator-ui
+IMAGE            ?= docker.io/alvarogg777/postgres-operator-ui
 VERSION          ?= $(shell git describe --tags --always --dirty)
 TAG              ?= $(VERSION)
 GITHEAD          = $(shell git rev-parse --short HEAD)

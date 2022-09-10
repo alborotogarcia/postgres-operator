@@ -23,7 +23,7 @@ spec:
       serviceAccountName: {{ include "postgres-operator-ui.serviceAccountName" . }}
       {{- if .Values.imagePullSecrets }}
       imagePullSecrets:
-      {{ toYaml .Values.imagePullSecrets | indent 8 }}
+      {{ toYaml .Values.imagePullSecrets | indent 4 }}
       {{- end }}
       containers:
         - name: "service"
