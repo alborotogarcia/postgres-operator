@@ -101,3 +101,4 @@ e2e/manifests
 *.pot
 
 mocks
+.github/workflows/run_e2e.yaml

@@ -1,0 +1,433 @@
+---
+# Source: minio/templates/post-install-prometheus-metrics-serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: minio-update-prometheus-secret
+  labels:
+    app: minio-update-prometheus-secret
+    chart: minio-8.0.10
+    release: minio
+    heritage: Helm
+---
+# Source: minio/templates/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: "minio"
+  namespace: "storage"
+  labels:
+    app: minio
+    chart: minio-8.0.10
+    release: "minio"
+---
+# Source: minio/templates/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: minio
+  labels:
+    app: minio
+    chart: minio-8.0.10
+    release: minio
+    heritage: Helm
+data:
+  initialize: |-
+    #!/bin/sh
+    set -e ; # Have script exit in the event of a failed command.
+    MC_CONFIG_DIR="/etc/minio/mc/"
+    MC="/usr/bin/mc --insecure --config-dir ${MC_CONFIG_DIR}"
+    
+    # connectToMinio
+    # Use a check-sleep-check loop to wait for Minio service to be available
+    connectToMinio() {
+      SCHEME=$1
+      ATTEMPTS=0 ; LIMIT=29 ; # Allow 30 attempts
+      set -e ; # fail if we can't read the keys.
+      ACCESS=$(cat /config/MINIO_ACCESS_KEY) ; SECRET=$(cat /config/MINIO_SECRET_KEY) ;
+      set +e ; # The connections to minio are allowed to fail.
+      echo "Connecting to Minio server: $SCHEME://$MINIO_ENDPOINT:$MINIO_PORT" ;
+      MC_COMMAND="${MC} config host add myminio $SCHEME://$MINIO_ENDPOINT:$MINIO_PORT $ACCESS $SECRET" ;
+      $MC_COMMAND ;
+      STATUS=$? ;
+      until [ $STATUS = 0 ]
+      do
+        ATTEMPTS=`expr $ATTEMPTS + 1` ;
+        echo \"Failed attempts: $ATTEMPTS\" ;
+        if [ $ATTEMPTS -gt $LIMIT ]; then
+          exit 1 ;
+        fi ;
+        sleep 2 ; # 1 second intervals between attempts
+        $MC_COMMAND ;
+        STATUS=$? ;
+      done ;
+      set -e ; # reset `e` as active
+      return 0
+    }
+    
+    # checkBucketExists ($bucket)
+    # Check if the bucket exists, by using the exit code of `mc ls`
+    checkBucketExists() {
+      BUCKET=$1
+      CMD=$(${MC} ls myminio/$BUCKET > /dev/null 2>&1)
+      return $?
+    }
+    
+    # createBucket ($bucket, $policy, $purge)
+    # Ensure bucket exists, purging if asked to
+    createBucket() {
+      BUCKET=$1
+      POLICY=$2
+      PURGE=$3
+      VERSIONING=$4
+    
+      # Purge the bucket, if set & exists
+      # Since PURGE is user input, check explicitly for `true`
+      if [ $PURGE = true ]; then
+        if checkBucketExists $BUCKET ; then
+          echo "Purging bucket '$BUCKET'."
+          set +e ; # don't exit if this fails
+          ${MC} rm -r --force myminio/$BUCKET
+          set -e ; # reset `e` as active
+        else
+          echo "Bucket '$BUCKET' does not exist, skipping purge."
+        fi
+      fi
+    
+      # Create the bucket if it does not exist
+      if ! checkBucketExists $BUCKET ; then
+        echo "Creating bucket '$BUCKET'"
+        ${MC} mb myminio/$BUCKET
+        if [ $BUCKET = "accuayto" ] ; then
+          ${MC} cp /storage/txtHeaders.pkl myminio/$BUCKET/txtHeaders.pkl
+          ${MC} cp /storage/aytoMetClustEdit.parquet myminio/$BUCKET/aytoMetClustEdit.parquet
+        fi
+      else
+        echo "Bucket '$BUCKET' already exists."
+      fi
+    
+    
+      # set versioning for bucket
+      if [ ! -z $VERSIONING ] ; then
+        if [ $VERSIONING = true ] ; then
+            echo "Enabling versioning for '$BUCKET'"
+            ${MC} version enable myminio/$BUCKET
+        elif [ $VERSIONING = false ] ; then
+            echo "Suspending versioning for '$BUCKET'"
+            ${MC} version suspend myminio/$BUCKET
+        fi
+      else
+          echo "Bucket '$BUCKET' versioning unchanged."
+      fi
+    
+      # At this point, the bucket should exist, skip checking for existence
+      # Set policy on the bucket
+      echo "Setting policy of bucket '$BUCKET' to '$POLICY'."
+      ${MC} policy set $POLICY myminio/$BUCKET
+    }
+    
+    # Try connecting to Minio instance
+    scheme=http
+    connectToMinio $scheme
+    # Create the buckets
+    createBucket accuayto none false 
+    createBucket mlflow none false 
+    createBucket bentoml none false 
+    createBucket accuayto none false 
+    createBucket ploomber none false 
+    createBucket storage none false 
+    createBucket temp none false
+---
+# Source: minio/templates/pvc.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minio
+  labels:
+    app: minio
+    chart: minio-8.0.10
+    release: minio
+    heritage: Helm
+spec:
+  accessModes:
+    - "ReadWriteOnce"
+  resources:
+    requests:
+      storage: "10Gi"
+  storageClassName: "longhorn"
+---
+# Source: minio/templates/post-install-prometheus-metrics-role.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: minio-update-prometheus-secret
+  labels:
+    app: minio-update-prometheus-secret
+    chart: minio-8.0.10
+    release: minio
+    heritage: Helm
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - get
+      - create
+      - update
+      - patch
+    resourceNames:
+      - minio-prometheus
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - create
+  - apiGroups:
+      - monitoring.coreos.com
+    resources:
+      - servicemonitors
+    verbs:
+      - get
+    resourceNames:
+      - minio
+---
+# Source: minio/templates/post-install-prometheus-metrics-rolebinding.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: minio-update-prometheus-secret
+  labels:
+    app: minio-update-prometheus-secret
+    chart: minio-8.0.10
+    release: minio
+    heritage: Helm
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: minio-update-prometheus-secret
+subjects:
+  - kind: ServiceAccount
+    name: minio-update-prometheus-secret
+    namespace: "storage"
+---
+# Source: minio/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  labels:
+    app: minio
+    chart: minio-8.0.10
+    release: minio
+    heritage: Helm
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 9000
+      protocol: TCP
+      targetPort: 9000
+    - name: console
+      port: 9090
+      protocol: TCP
+      targetPort: 9090
+  selector:
+    app: minio
+    release: minio
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: minio-ingress
+  annotations:
+    kubernetes.io/ingress.class: traefik
+    external-dns.alpha.kubernetes.io/hostname: minio.alboroto.live
+    external-dns.alpha.kubernetes.io/cloudflare-proxied: "true"
+    cert-manager.io/cluster-issuer: letsencrypt-stg
+    traefik.frontend.passHostHeader: "true"
+    ingress.kubernetes.io/auth-url: http://authelia-service.istio-system.svc:80/api/verify?rd=https://auth.alboroto.live/
+    # traefik.ingress.kubernetes.io/router.middlewares: istio-system-authelia@kubernetescrd
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    # traefik.ingress.kubernetes.io/router.tls: "true"
+    traefik.ingress.kubernetes.io/router.tls.certresolver: cloudflare
+spec:
+  tls:
+    - secretName: authelia-ingress-tls # alboroto.live
+      hosts:
+        - minio.alboroto.live
+  rules:
+    - host: minio.alboroto.live
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: minio
+                port:
+                  number: 9000 # 9090 # 9000
+---
+# Source: minio/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  labels:
+    app: minio
+    chart: minio-8.0.10
+    release: minio
+    heritage: Helm
+spec:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 100%
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: minio
+      release: minio
+  template:
+    metadata:
+      name: minio
+      labels:
+        app: minio
+        release: minio
+    spec:
+      #affinity:
+      #  nodeAffinity:
+      #    requiredDuringSchedulingIgnoredDuringExecution:
+      #      nodeSelectorTerms:
+      #      - matchExpressions:
+      #        - key: kubernetes.io/hostname
+      #          operator: NotIn
+      #          values:
+      #          - knode1
+      serviceAccountName: "minio"
+      #securityContext:
+      #  runAsUser: 1000
+      #  runAsGroup: 1000
+      #  fsGroup: 1000
+      #  fsGroupChangePolicy: "OnRootMismatch"
+      #initContainers:
+      #- name: changeowner
+      #  image: busybox
+      #  command: ["sh", "-c", "chown -R 1000:1000 /export"]
+      #  volumeMounts:
+      #  - name: export
+      #    mountPath: /export
+      containers:
+        - name: minio
+          # image: minio/minio:RELEASE.2021-09-03T03-56-13Z
+          image: minio/minio:RELEASE.2021-02-14T04-01-33Z
+          # image: "minio/minio:RELEASE.2021-07-30T00-02-00Z"
+          imagePullPolicy: IfNotPresent
+          command:
+            - "/bin/sh"
+            - "-ce"
+            - "/usr/bin/docker-entrypoint.sh minio -S /etc/minio/certs/ server /export " # --console-address=:$CONSOLE_PORT "
+          volumeMounts:
+            - name: export
+              mountPath: /export            
+          ports:
+            - name: http
+              containerPort: 9000
+          env:
+            - name: MINIO_ACCESS_KEY
+              value: minio
+              #valueFrom:
+              #  secretKeyRef:
+              #    name: storage-secrets
+              #    key: MINIO_ACCESS_KEY
+            - name: MINIO_SECRET_KEY
+              value: minio123
+              #valueFrom:
+              #  secretKeyRef:
+              #    name: storage-secrets
+              #    key: MINIO_SECRET_KEY
+            - name: MINIO_IDENTITY_OPENID_CONFIG_URL
+              value: https://kc.alboroto.live/auth/realms/alborotoproject/.well-known/openid-configuration
+              # value: http://kc-keycloak-http.istio-system.svc/auth/realms/master/.well-known/openid-configuration
+              # value: https://kc-keycloak-http.istio-system.svc:8443/auth/realms/master/.well-known/openid-configuration
+            - name: MINIO_OPERATOR_TLS_ENABLE
+              value: "off"
+            - name: MINIO_IDENTITY_OPENID_CLIENT_ID
+              value: account
+              # value: authelia-cli
+            - name: CONSOLE_PORT
+              value: "9090"
+            - name: MINIO_IDENTITY_OPENID_SCOPES
+              value: openid,profile,email # openid # roles
+            #  value: openid,miniomapper # profile,email
+            - name: MINIO_IDENTITY_OPENID_CLAIM_NAME
+              value: policy # readwrite
+            - name: MINIO_IDENTITY_OPENID_CLIENT_SECRET
+              value: b9a9a44e-360d-4816-aa11-0fd80f83ce8c
+            - name: MINIO_SERVER_URL
+              value: https://minio.alboroto.live
+            - name: MINIO_DOMAIN
+              value: minio.alboroto.live
+            - name: MINIO_BROWSER_REDIRECT_URL
+              value: https://minio.alboroto.live
+            #- name: MINIO_IDENTITY_OPENID_REDIRECT_URI
+            #  value: https://minio.alboroto.live/oauth_callback
+          resources:
+            requests:
+              memory: 4Gi      
+      imagePullSecrets:
+        - name: regcred
+      volumes:
+        - name: export
+          persistentVolumeClaim:
+            claimName: minio
+---
+# Source: minio/templates/post-install-create-bucket-job.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-make-bucket-job
+  labels:
+    app: minio-make-bucket-job
+    chart: minio-8.0.10
+    release: minio
+    heritage: Helm
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-delete-policy": hook-succeeded,before-hook-creation
+spec:
+  template:
+    metadata:
+      labels:
+        app: minio-job
+        release: minio
+    spec:
+      restartPolicy: OnFailure      
+      imagePullSecrets:
+        - name: regcred
+      volumes:
+        - name: minio-configuration
+          projected:
+            sources:
+            - configMap:
+                name: minio
+            - secret:
+                name: storage-secrets
+      serviceAccountName: "minio"
+      containers:
+      - name: minio-mc
+        image: alvarogg777/arm64v8:ds-minio # "minio/mc:RELEASE.2021-02-14T04-28-06Z"
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/sh", "/config/initialize"]
+        env:
+          - name: MINIO_ENDPOINT
+            value: minio
+          - name: MINIO_PORT
+            value: "9000"
+        volumeMounts:
+          - name: minio-configuration
+            mountPath: /config
+        resources:
+          requests:
+            memory: 128Mi

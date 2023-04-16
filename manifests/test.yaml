@@ -1,0 +1,125 @@
+apiVersion: "acid.zalan.do/v1"
+kind: postgresql
+metadata:
+  name: acid-minimal-cluster
+spec:
+  teamId: "acid"
+  initContainers:
+    - name: fs-permissions
+      image: busybox
+      command: ['sh','-c']
+      args:
+        - 'chown -R 1000:1000 /mnt/pgdata'
+      securityContext:
+          runAsUser: 0
+      volumeMounts:
+        - mountPath: /mnt/pgdata
+          name: pgdata
+  volume:
+    size: 20Gi
+    storageClass: longhorn
+  numberOfInstances: 2
+  users:
+    postgres:
+    - superuser
+    - createdb
+    - login
+    mlflow:
+    - createdb
+    - login
+    zalando:  # database owner
+    - superuser
+    - createdb
+    keycloak:
+    - createdb
+    - login
+    authelia:
+    - createdb
+    - login
+    grafana:
+    - createdb
+    - login
+    istio:
+    - createdb
+    - login
+    kafka:
+    - createdb
+    airflow:
+    - createdb
+    - login
+    foo_user: []  # role for application foo
+  # spiloRunAsUser: 3000
+  # spiloFSGroup: 2000
+  # spiloRunAsGroup: 3000
+  databases:
+    ayto: alboroto
+    alboroto: alboroto
+    authelia: authelia
+    istio: istio
+    keycloak: keycloak
+    grafana: grafana
+    mlflow: mlflow
+    bentoml: mlflow
+    superset: mlflow
+    airflow: airflow
+    kafka: kafka
+    # foo: zalando  # dbname: owner
+  preparedDatabases:
+    ayto:
+      defaultUsers: true
+      schemas:
+        ayto:
+          defaultUsers: true
+    alboroto:
+      defaultUsers: true
+      schemas:
+        ayto:
+          defaultUsers: true
+    authelia:
+      defaultUsers: true
+      schemas:
+        ayto:
+          defaultUsers: true
+    istio:
+      defaultUsers: true
+      schemas:
+        ayto:
+          defaultUsers: true
+    keycloak:
+      defaultUsers: true
+      schemas:
+        ayto:
+          defaultUsers: true
+    grafana:
+      defaultUsers: true
+      schemas:
+        ayto:
+          defaultUsers: true
+    mlflow:
+      defaultUsers: true
+      schemas:
+        ayto:
+          defaultUsers: true
+    bentoml:
+      defaultUsers: true
+      schemas:
+        ayto:
+          defaultUsers: true
+    superset:
+      defaultUsers: true
+      schemas:
+        ayto:
+          defaultUsers: true
+    airflow:
+      defaultUsers: true
+      schemas:
+        ayto:
+          defaultUsers: true
+    kafka:
+      defaultUsers: true
+      schemas:
+        ayto:
+          defaultUsers: true
+    # bar: {}
+  postgresql:
+    version: "15"
