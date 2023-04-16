@@ -32,7 +32,8 @@ const (
 	RoleOriginTeamsAPI
 	RoleOriginSystem
 	RoleOriginBootstrap
-	RoleConnectionPooler
+	RoleOriginConnectionPooler
+	RoleOriginStream
 )
 
 type syncUserOperation int
@@ -55,7 +56,9 @@ type PgUser struct {
 	MemberOf   []string          `yaml:"inrole"`
 	Parameters map[string]string `yaml:"db_parameters"`
 	AdminRole  string            `yaml:"admin_role"`
+	IsDbOwner  bool              `yaml:"is_db_owner"`
 	Deleted    bool              `yaml:"deleted"`
+	Rotated    bool              `yaml:"rotated"`
 }
 
 func (user *PgUser) Valid() bool {
@@ -117,6 +120,7 @@ type ControllerConfig struct {
 	CRDReadyWaitTimeout  time.Duration
 	ConfigMapName        NamespacedName
 	Namespace            string
+	IgnoredAnnotations   []string
 
 	EnableJsonLogging bool
 }
@@ -192,7 +196,7 @@ func (r RoleOrigin) String() string {
 		return "system role"
 	case RoleOriginBootstrap:
 		return "bootstrapped role"
-	case RoleConnectionPooler:
+	case RoleOriginConnectionPooler:
 		return "connection pooler role"
 	default:
 		panic(fmt.Sprintf("bogus role origin value %d", r))

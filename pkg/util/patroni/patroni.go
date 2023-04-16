@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"math"
 	"net"
 	"net/http"
 	"strconv"
@@ -21,14 +22,16 @@ import (
 const (
 	failoverPath = "/failover"
 	configPath   = "/config"
+	clusterPath  = "/cluster"
 	statusPath   = "/patroni"
 	restartPath  = "/restart"
-	apiPort      = 8008
+	ApiPort      = 8008
 	timeout      = 30 * time.Second
 )
 
 // Interface describe patroni methods
 type Interface interface {
+	GetClusterMembers(master *v1.Pod) ([]ClusterMember, error)
 	Switchover(master *v1.Pod, candidate string) error
 	SetPostgresParameters(server *v1.Pod, options map[string]string) error
 	GetMemberData(server *v1.Pod) (MemberData, error)
@@ -71,7 +74,7 @@ func apiURL(masterPod *v1.Pod) (string, error) {
 			return "", fmt.Errorf("%s is not a valid IPv4/IPv6 address", masterPod.Status.PodIP)
 		}
 	}
-	return fmt.Sprintf("http://%s", net.JoinHostPort(ip.String(), strconv.Itoa(apiPort))), nil
+	return fmt.Sprintf("http://%s", net.JoinHostPort(ip.String(), strconv.Itoa(ApiPort))), nil
 }
 
 func (p *Patroni) httpPostOrPatch(method string, url string, body *bytes.Buffer) (err error) {
@@ -175,6 +178,36 @@ func (p *Patroni) SetConfig(server *v1.Pod, config map[string]interface{}) error
 	return p.httpPostOrPatch(http.MethodPatch, apiURLString+configPath, buf)
 }
 
+// ClusterMembers array of cluster members from Patroni API
+type ClusterMembers struct {
+	Members []ClusterMember `json:"members"`
+}
+
+// ClusterMember cluster member data from Patroni API
+type ClusterMember struct {
+	Name     string         `json:"name"`
+	Role     string         `json:"role"`
+	State    string         `json:"state"`
+	Timeline int            `json:"timeline"`
+	Lag      ReplicationLag `json:"lag,omitempty"`
+}
+
+type ReplicationLag uint64
+
+// UnmarshalJSON converts member lag (can be int or string) into uint64
+func (rl *ReplicationLag) UnmarshalJSON(data []byte) error {
+	var lagUInt64 uint64
+	if data[0] == '"' {
+		*rl = math.MaxUint64
+		return nil
+	}
+	if err := json.Unmarshal(data, &lagUInt64); err != nil {
+		return err
+	}
+	*rl = ReplicationLag(lagUInt64)
+	return nil
+}
+
 // MemberDataPatroni child element
 type MemberDataPatroni struct {
 	Version string `json:"version"`
@@ -244,6 +277,27 @@ func (p *Patroni) Restart(server *v1.Pod) error {
 	p.logger.Infof("Postgres server successfuly restarted in pod %s", server.Name)
 
 	return nil
+}
+
+// GetClusterMembers read cluster data from patroni API
+func (p *Patroni) GetClusterMembers(server *v1.Pod) ([]ClusterMember, error) {
+
+	apiURLString, err := apiURL(server)
+	if err != nil {
+		return []ClusterMember{}, err
+	}
+	body, err := p.httpGet(apiURLString + clusterPath)
+	if err != nil {
+		return []ClusterMember{}, err
+	}
+
+	data := ClusterMembers{}
+	err = json.Unmarshal([]byte(body), &data)
+	if err != nil {
+		return []ClusterMember{}, err
+	}
+
+	return data.Members, nil
 }
 
 // GetMemberData read member data from patroni API

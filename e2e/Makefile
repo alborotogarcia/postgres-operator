@@ -32,7 +32,7 @@ clean:
 
 copy: clean
 	mkdir manifests
-	cp ../manifests -r .
+	cp -r ../manifests .
 
 docker: scm-source.json
 	docker build -t "$(IMAGE):$(TAG)" .
@@ -45,9 +45,9 @@ push: docker
 
 tools:
 	# install pinned version of 'kind'
-	# go get must run outside of a dir with a (module-based) Go project !
-	# otherwise go get updates project's dependencies and/or behaves differently
-	cd "/tmp" && GO111MODULE=on go get sigs.k8s.io/kind@v0.11.1
+	# go install must run outside of a dir with a (module-based) Go project !
+	# otherwise go install updates project's dependencies and/or behaves differently
+	cd "/tmp" && GO111MODULE=on go install sigs.k8s.io/kind@v0.14.0
 
 e2etest: tools copy clean
 	./run.sh main

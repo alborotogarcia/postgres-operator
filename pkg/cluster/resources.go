@@ -7,9 +7,9 @@ import (
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
-	batchv1beta1 "k8s.io/api/batch/v1beta1"
+	batchv1 "k8s.io/api/batch/v1"
 	v1 "k8s.io/api/core/v1"
-	policybeta1 "k8s.io/api/policy/v1beta1"
+	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -35,8 +35,10 @@ func (c *Cluster) listResources() error {
 		c.logger.Infof("found secret: %q (uid: %q) namesapce: %s", util.NameFromMeta(obj.ObjectMeta), obj.UID, obj.ObjectMeta.Namespace)
 	}
 
-	for role, endpoint := range c.Endpoints {
-		c.logger.Infof("found %s endpoint: %q (uid: %q)", role, util.NameFromMeta(endpoint.ObjectMeta), endpoint.UID)
+	if !c.patroniKubernetesUseConfigMaps() {
+		for role, endpoint := range c.Endpoints {
+			c.logger.Infof("found %s endpoint: %q (uid: %q)", role, util.NameFromMeta(endpoint.ObjectMeta), endpoint.UID)
+		}
 	}
 
 	for role, service := range c.Services {
@@ -275,7 +277,7 @@ func (c *Cluster) createService(role PostgresRole) (*v1.Service, error) {
 	return service, nil
 }
 
-func (c *Cluster) updateService(role PostgresRole, newService *v1.Service) error {
+func (c *Cluster) updateService(role PostgresRole, oldService *v1.Service, newService *v1.Service) (*v1.Service, error) {
 	var (
 		svc *v1.Service
 		err error
@@ -283,11 +285,7 @@ func (c *Cluster) updateService(role PostgresRole, newService *v1.Service) error
 
 	c.setProcessName("updating %v service", role)
 
-	if c.Services[role] == nil {
-		return fmt.Errorf("there is no service in the cluster")
-	}
-
-	serviceName := util.NameFromMeta(c.Services[role].ObjectMeta)
+	serviceName := util.NameFromMeta(oldService.ObjectMeta)
 
 	// update the service annotation in order to propagate ELB notation.
 	if len(newService.ObjectMeta.Annotations) > 0 {
@@ -301,39 +299,38 @@ func (c *Cluster) updateService(role PostgresRole, newService *v1.Service) error
 				"")
 
 			if err != nil {
-				return fmt.Errorf("could not replace annotations for the service %q: %v", serviceName, err)
+				return nil, fmt.Errorf("could not replace annotations for the service %q: %v", serviceName, err)
 			}
 		} else {
-			return fmt.Errorf("could not form patch for the service metadata: %v", err)
+			return nil, fmt.Errorf("could not form patch for the service metadata: %v", err)
 		}
 	}
 
 	// now, patch the service spec, but when disabling LoadBalancers do update instead
 	// patch does not work because of LoadBalancerSourceRanges field (even if set to nil)
-	oldServiceType := c.Services[role].Spec.Type
+	oldServiceType := oldService.Spec.Type
 	newServiceType := newService.Spec.Type
 	if newServiceType == "ClusterIP" && newServiceType != oldServiceType {
-		newService.ResourceVersion = c.Services[role].ResourceVersion
-		newService.Spec.ClusterIP = c.Services[role].Spec.ClusterIP
+		newService.ResourceVersion = oldService.ResourceVersion
+		newService.Spec.ClusterIP = oldService.Spec.ClusterIP
 		svc, err = c.KubeClient.Services(serviceName.Namespace).Update(context.TODO(), newService, metav1.UpdateOptions{})
 		if err != nil {
-			return fmt.Errorf("could not update service %q: %v", serviceName, err)
+			return nil, fmt.Errorf("could not update service %q: %v", serviceName, err)
 		}
 	} else {
 		patchData, err := specPatch(newService.Spec)
 		if err != nil {
-			return fmt.Errorf("could not form patch for the service %q: %v", serviceName, err)
+			return nil, fmt.Errorf("could not form patch for the service %q: %v", serviceName, err)
 		}
 
 		svc, err = c.KubeClient.Services(serviceName.Namespace).Patch(
 			context.TODO(), serviceName.Name, types.MergePatchType, patchData, metav1.PatchOptions{}, "")
 		if err != nil {
-			return fmt.Errorf("could not patch service %q: %v", serviceName, err)
+			return nil, fmt.Errorf("could not patch service %q: %v", serviceName, err)
 		}
 	}
-	c.Services[role] = svc
 
-	return nil
+	return svc, nil
 }
 
 func (c *Cluster) deleteService(role PostgresRole) error {
@@ -407,7 +404,7 @@ func (c *Cluster) generateEndpointSubsets(role PostgresRole) []v1.EndpointSubset
 	return result
 }
 
-func (c *Cluster) createPodDisruptionBudget() (*policybeta1.PodDisruptionBudget, error) {
+func (c *Cluster) createPodDisruptionBudget() (*policyv1.PodDisruptionBudget, error) {
 	podDisruptionBudgetSpec := c.generatePodDisruptionBudget()
 	podDisruptionBudget, err := c.KubeClient.
 		PodDisruptionBudgets(podDisruptionBudgetSpec.Namespace).
@@ -421,7 +418,7 @@ func (c *Cluster) createPodDisruptionBudget() (*policybeta1.PodDisruptionBudget,
 	return podDisruptionBudget, nil
 }
 
-func (c *Cluster) updatePodDisruptionBudget(pdb *policybeta1.PodDisruptionBudget) error {
+func (c *Cluster) updatePodDisruptionBudget(pdb *policyv1.PodDisruptionBudget) error {
 	if c.PodDisruptionBudget == nil {
 		return fmt.Errorf("there is no pod disruption budget in the cluster")
 	}
@@ -496,18 +493,17 @@ func (c *Cluster) deleteEndpoint(role PostgresRole) error {
 
 func (c *Cluster) deleteSecrets() error {
 	c.setProcessName("deleting secrets")
-	var errors []string
-	errorCount := 0
+	errors := make([]string, 0)
+
 	for uid, secret := range c.Secrets {
 		err := c.deleteSecret(uid, *secret)
 		if err != nil {
 			errors = append(errors, fmt.Sprintf("%v", err))
-			errorCount++
 		}
 	}
 
-	if errorCount > 0 {
-		return fmt.Errorf("could not delete all secrets: %v", errors)
+	if len(errors) > 0 {
+		return fmt.Errorf("could not delete all secrets: %v", strings.Join(errors, `', '`))
 	}
 
 	return nil
@@ -522,7 +518,7 @@ func (c *Cluster) deleteSecret(uid types.UID, secret v1.Secret) error {
 		return fmt.Errorf("could not delete secret %q: %v", secretName, err)
 	}
 	c.logger.Infof("secret %q has been deleted", secretName)
-	c.Secrets[uid] = nil
+	delete(c.Secrets, uid)
 
 	return nil
 }
@@ -550,7 +546,7 @@ func (c *Cluster) createLogicalBackupJob() (err error) {
 	return nil
 }
 
-func (c *Cluster) patchLogicalBackupJob(newJob *batchv1beta1.CronJob) error {
+func (c *Cluster) patchLogicalBackupJob(newJob *batchv1.CronJob) error {
 	c.setProcessName("patching logical backup job")
 
 	patchData, err := specPatch(newJob.Spec)
@@ -595,7 +591,7 @@ func (c *Cluster) GetEndpointMaster() *v1.Endpoints {
 	return c.Endpoints[Master]
 }
 
-// GetEndpointReplica returns cluster's kubernetes master Endpoint
+// GetEndpointReplica returns cluster's kubernetes replica Endpoint
 func (c *Cluster) GetEndpointReplica() *v1.Endpoints {
 	return c.Endpoints[Replica]
 }
@@ -606,6 +602,6 @@ func (c *Cluster) GetStatefulSet() *appsv1.StatefulSet {
 }
 
 // GetPodDisruptionBudget returns cluster's kubernetes PodDisruptionBudget
-func (c *Cluster) GetPodDisruptionBudget() *policybeta1.PodDisruptionBudget {
+func (c *Cluster) GetPodDisruptionBudget() *policyv1.PodDisruptionBudget {
 	return c.PodDisruptionBudget
 }

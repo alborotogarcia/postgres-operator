@@ -1,5 +1,5 @@
-# FROM registry.opensource.zalan.do/library/alpine-3.12:latest
-FROM alpine:3.12 
+FROM registry.opensource.zalan.do/library/alpine-3.15:latest
+# FROM alpine:3.15
 LABEL maintainer="Team ACID @ Zalando <team-acid@zalando.de>"
 
 EXPOSE 8081

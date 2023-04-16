@@ -19,7 +19,7 @@ func newFakeK8sAnnotationsClient() (k8sutil.KubernetesClient, *k8sFake.Clientset
 	acidClientSet := fakeacidv1.NewSimpleClientset()
 
 	return k8sutil.KubernetesClient{
-		PodDisruptionBudgetsGetter: clientSet.PolicyV1beta1(),
+		PodDisruptionBudgetsGetter: clientSet.PolicyV1(),
 		ServicesGetter:             clientSet.CoreV1(),
 		StatefulSetsGetter:         clientSet.AppsV1(),
 		PostgresqlsGetter:          acidClientSet.AcidV1(),
@@ -57,7 +57,7 @@ func TestInheritedAnnotations(t *testing.T) {
 					ConnectionPoolerDefaultCPULimit:      "100m",
 					ConnectionPoolerDefaultMemoryRequest: "100Mi",
 					ConnectionPoolerDefaultMemoryLimit:   "100Mi",
-					NumberOfInstances:                    int32ToPointer(1),
+					NumberOfInstances:                    k8sutil.Int32ToPointer(1),
 				},
 				PodManagementPolicy: "ordered_ready",
 				Resources: config.Resources{
@@ -98,8 +98,8 @@ func TestInheritedAnnotations(t *testing.T) {
 			t.Errorf("%s: pod template %v not inherited annotations %#v, got %#v", testName, sts.ObjectMeta.Name, inheritedAnnotations, sts.ObjectMeta.Annotations)
 		}
 		// pvc template
-		if util.MapContains(sts.Spec.VolumeClaimTemplates[0].Annotations, inheritedAnnotations) {
-			t.Errorf("%s: PVC template %v not expected to have inherited annotations %#v, got %#v", testName, sts.ObjectMeta.Name, inheritedAnnotations, sts.ObjectMeta.Annotations)
+		if !(util.MapContains(sts.Spec.VolumeClaimTemplates[0].Annotations, inheritedAnnotations)) {
+			t.Errorf("%s: PVC template %v not inherited annotations %#v, got %#v", testName, sts.ObjectMeta.Name, inheritedAnnotations, sts.ObjectMeta.Annotations)
 		}
 	}
 

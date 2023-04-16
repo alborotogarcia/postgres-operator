@@ -79,26 +79,44 @@ TOKENINFO_URL = getenv('OAUTH2_TOKEN_INFO_URL')
 
 OPERATOR_API_URL = getenv('OPERATOR_API_URL', 'http://postgres-operator')
 OPERATOR_CLUSTER_NAME_LABEL = getenv('OPERATOR_CLUSTER_NAME_LABEL', 'cluster-name')
-OPERATOR_UI_CONFIG = getenv('OPERATOR_UI_CONFIG', '{}')
+OPERATOR_UI_CONFIG = loads(getenv('OPERATOR_UI_CONFIG', '{}'))
 OPERATOR_UI_MAINTENANCE_CHECK = getenv('OPERATOR_UI_MAINTENANCE_CHECK', '{}')
 READ_ONLY_MODE = getenv('READ_ONLY_MODE', False) in [True, 'true']
-RESOURCES_VISIBLE = getenv('RESOURCES_VISIBLE', True)
 SPILO_S3_BACKUP_PREFIX = getenv('SPILO_S3_BACKUP_PREFIX', 'spilo/')
 SUPERUSER_TEAM = getenv('SUPERUSER_TEAM', 'acid')
 TARGET_NAMESPACE = getenv('TARGET_NAMESPACE')
 GOOGLE_ANALYTICS = getenv('GOOGLE_ANALYTICS', False)
 MIN_PODS= getenv('MIN_PODS', 2)
+RESOURCES_VISIBLE = getenv('RESOURCES_VISIBLE', True)
+CUSTOM_MESSAGE_RED = getenv('CUSTOM_MESSAGE_RED', '')
 
-# storage pricing, i.e. https://aws.amazon.com/ebs/pricing/
-COST_EBS = float(getenv('COST_EBS', 0.119))  # GB per month
+APPLICATION_DEPLOYMENT_DOCS = getenv('APPLICATION_DEPLOYMENT_DOCS', '')
+CONNECTION_DOCS = getenv('CONNECTION_DOCS', '')
+
+# storage pricing, i.e. https://aws.amazon.com/ebs/pricing/ (e.g. Europe - Franfurt)
+COST_EBS = float(getenv('COST_EBS', 0.0952))  # GB per month
+COST_IOPS = float(getenv('COST_IOPS', 0.006))  # IOPS per month above 3000 baseline
+COST_THROUGHPUT = float(getenv('COST_THROUGHPUT', 0.0476))  # MB/s per month above 125 MB/s baseline
 
 # compute costs, i.e. https://www.ec2instances.info/?region=eu-central-1&selected=m5.2xlarge
-COST_CORE = 30.5 * 24 * float(getenv('COST_CORE', 0.0575))  # Core per hour m5.2xlarge / 8.
-COST_MEMORY = 30.5 * 24 * float(getenv('COST_MEMORY', 0.014375))  # Memory GB m5.2xlarge / 32.
+COST_CORE = float(getenv('COST_CORE', 0.0575))  # Core per hour m5.2xlarge / 8.
+COST_MEMORY = float(getenv('COST_MEMORY', 0.014375))  # Memory GB m5.2xlarge / 32.
+COST_ELB = float(getenv('COST_ELB', 0.03))     # per hour
+
+# maximum and limitation of IOPS and throughput 
+FREE_IOPS = float(getenv('FREE_IOPS', 3000)) 
+LIMIT_IOPS = float(getenv('LIMIT_IOPS', 16000))
+FREE_THROUGHPUT = float(getenv('FREE_THROUGHPUT', 125))
+LIMIT_THROUGHPUT = float(getenv('LIMIT_THROUGHPUT', 1000))
+# get the default value of core and memory
+DEFAULT_MEMORY = getenv('DEFAULT_MEMORY', '300Mi')
+DEFAULT_MEMORY_LIMIT = getenv('DEFAULT_MEMORY_LIMIT', '300Mi')
+DEFAULT_CPU = getenv('DEFAULT_CPU', '10m')
+DEFAULT_CPU_LIMIT = getenv('DEFAULT_CPU_LIMIT', '300m')
 
 WALE_S3_ENDPOINT = getenv(
     'WALE_S3_ENDPOINT',
-    'https+path://s3-eu-central-1.amazonaws.com:443',
+    'https+path://s3.eu-central-1.amazonaws.com:443',
 )
 
 USE_AWS_INSTANCE_PROFILE = (
@@ -302,27 +320,35 @@ DEFAULT_UI_CONFIG = {
     'nat_gateways_visible': True,
     'users_visible': True,
     'databases_visible': True,
-    'resources_visible': True,
-    'postgresql_versions': ['11','12','13'],
-    'dns_format_string': '{0}.{1}.{2}',
+    'resources_visible': RESOURCES_VISIBLE,
+    'postgresql_versions': ['11', '12', '13', '14', '15'],
+    'dns_format_string': '{0}.{1}',
     'pgui_link': '',
     'static_network_whitelist': {},
+    'read_only_mode': READ_ONLY_MODE,
+    'superuser_team': SUPERUSER_TEAM,
+    'target_namespace': TARGET_NAMESPACE,
+    'connection_docs': CONNECTION_DOCS,
+    'application_deployment_docs': APPLICATION_DEPLOYMENT_DOCS,
     'cost_ebs': COST_EBS,
+    'cost_iops': COST_IOPS,
+    'cost_throughput': COST_THROUGHPUT,
     'cost_core': COST_CORE,
     'cost_memory': COST_MEMORY,
-    'min_pods': MIN_PODS
+    'cost_elb': COST_ELB,
+    'min_pods': MIN_PODS,
+    'free_iops': FREE_IOPS, 
+    'free_throughput': FREE_THROUGHPUT,
+    'limit_iops': LIMIT_IOPS,
+    'limit_throughput': LIMIT_THROUGHPUT
 }
 
 
 @app.route('/config')
 @authorize
 def get_config():
-    config = loads(OPERATOR_UI_CONFIG) or DEFAULT_UI_CONFIG
-    config['read_only_mode'] = READ_ONLY_MODE
-    config['resources_visible'] = RESOURCES_VISIBLE
-    config['superuser_team'] = SUPERUSER_TEAM
-    config['target_namespace'] = TARGET_NAMESPACE
-    config['min_pods'] = MIN_PODS
+    config = DEFAULT_UI_CONFIG.copy() 
+    config.update(OPERATOR_UI_CONFIG)
 
     config['namespaces'] = (
         [TARGET_NAMESPACE]
@@ -482,11 +508,13 @@ def get_postgresqls():
     postgresqls = [
         {
             'nodes': spec.get('numberOfInstances', ''),
-            'memory': spec.get('resources', {}).get('requests', {}).get('memory', 0),
-            'memory_limit': spec.get('resources', {}).get('limits', {}).get('memory', 0),
-            'cpu': spec.get('resources', {}).get('requests', {}).get('cpu', 0),
-            'cpu_limit': spec.get('resources', {}).get('limits', {}).get('cpu', 0),
+            'memory': spec.get('resources', {}).get('requests', {}).get('memory', OPERATOR_UI_CONFIG.get("default_memory", DEFAULT_MEMORY)),
+            'memory_limit': spec.get('resources', {}).get('limits', {}).get('memory', OPERATOR_UI_CONFIG.get("default_memory_limit", DEFAULT_MEMORY_LIMIT)),
+            'cpu': spec.get('resources', {}).get('requests', {}).get('cpu', OPERATOR_UI_CONFIG.get("default_cpu", DEFAULT_CPU)),
+            'cpu_limit': spec.get('resources', {}).get('limits', {}).get('cpu', OPERATOR_UI_CONFIG.get("default_cpu_limit", DEFAULT_CPU_LIMIT)),
             'volume_size': spec.get('volume', {}).get('size', 0),
+            'iops': spec.get('volume', {}).get('iops', 3000),
+            'throughput': spec.get('volume', {}).get('throughput', 125),
             'team': (
                 spec.get('teamId') or
                 metadata.get('labels', {}).get('team', '')
@@ -497,6 +525,8 @@ def get_postgresqls():
             'namespaced_name': namespace + '/' + name,
             'full_name': namespace + '/' + name + ('/' + uid if uid else ''),
             'status': status,
+            'num_elb': spec.get('enableMasterLoadBalancer', 0) + spec.get('enableReplicaLoadBalancer', 0) + \
+                       spec.get('enableMasterPoolerLoadBalancer', 0) + spec.get('enableReplicaPoolerLoadBalancer', 0),
         }
         for cluster in these(
             read_postgresqls(
@@ -614,49 +644,42 @@ def update_postgresql(namespace: str, cluster: str):
 
         spec['volume'] = {'size': size}
 
-    if 'enableConnectionPooler' in postgresql['spec']:
-        cp = postgresql['spec']['enableConnectionPooler']
-        if not cp:
-            if 'enableConnectionPooler' in o['spec']:
-                del o['spec']['enableConnectionPooler']
-        else:
-            spec['enableConnectionPooler'] = True
-    else:
-        if 'enableConnectionPooler' in o['spec']:
-            del o['spec']['enableConnectionPooler']
+    if (
+        'volume' in postgresql['spec']
+        and 'iops' in postgresql['spec']['volume']
+        and postgresql['spec']['volume']['iops'] != None
+    ):
+        iops = int(postgresql['spec']['volume']['iops'])
+        if not 'volume' in spec:
+            spec['volume'] = {}
 
-    if 'enableReplicaConnectionPooler' in postgresql['spec']:
-        cp = postgresql['spec']['enableReplicaConnectionPooler']
-        if not cp:
-            if 'enableReplicaConnectionPooler' in o['spec']:
-                del o['spec']['enableReplicaConnectionPooler']
-        else:
-            spec['enableReplicaConnectionPooler'] = True
-    else:
-        if 'enableReplicaConnectionPooler' in o['spec']:
-            del o['spec']['enableReplicaConnectionPooler']
+        spec['volume']['iops'] = iops
 
-    if 'enableReplicaLoadBalancer' in postgresql['spec']:
-        rlb = postgresql['spec']['enableReplicaLoadBalancer']
-        if not rlb:
-            if 'enableReplicaLoadBalancer' in o['spec']:
-                del o['spec']['enableReplicaLoadBalancer']
-        else:
-            spec['enableReplicaLoadBalancer'] = True
-    else:
-        if 'enableReplicaLoadBalancer' in o['spec']:
-            del o['spec']['enableReplicaLoadBalancer']
+    if (
+        'volume' in postgresql['spec']
+        and 'throughput' in postgresql['spec']['volume']
+        and postgresql['spec']['volume']['throughput'] != None
+    ):
+        throughput = int(postgresql['spec']['volume']['throughput'])
+        if not 'volume' in spec:
+            spec['volume'] = {}
 
-    if 'enableMasterLoadBalancer' in postgresql['spec']:
-        rlb = postgresql['spec']['enableMasterLoadBalancer']
-        if not rlb:
-            if 'enableMasterLoadBalancer' in o['spec']:
-                del o['spec']['enableMasterLoadBalancer']
+        spec['volume']['throughput'] = throughput
+
+    additional_specs = ['enableMasterLoadBalancer',
+                        'enableReplicaLoadBalancer',
+                        'enableConnectionPooler',
+                        'enableReplicaConnectionPooler',
+                        'enableMasterPoolerLoadBalancer',
+                        'enableReplicaPoolerLoadBalancer',
+                        ]
+
+    for var in additional_specs:
+        if postgresql['spec'].get(var):
+            spec[var] = True
         else:
-            spec['enableMasterLoadBalancer'] = True
-    else:
-        if 'enableMasterLoadBalancer' in o['spec']:
-            del o['spec']['enableMasterLoadBalancer']
+            if var in o['spec']:
+                del o['spec'][var]
 
     if 'users' in postgresql['spec']:
         spec['users'] = postgresql['spec']['users']
@@ -757,6 +780,27 @@ def update_postgresql(namespace: str, cluster: str):
                     VALID_USERNAME=VALID_USERNAME.pattern,
                     owner_username=owner_username,
                 )
+
+    resource_types = ["cpu","memory"]
+    resource_constraints = ["requests","limits"]
+    if "resources" in postgresql["spec"]:
+        spec["resources"] = {}
+
+        res = postgresql["spec"]["resources"]
+        for rt in resource_types:
+            for rc in resource_constraints:
+                if rc in res:
+                    if rt in res[rc]:
+                        if not rc in spec["resources"]:
+                            spec["resources"][rc] = {}
+                        spec["resources"][rc][rt] = res[rc][rt]
+
+    if "postgresql" in postgresql["spec"]:
+        if "version" in postgresql["spec"]["postgresql"]:
+            if "postgresql" not in spec:
+                spec["postgresql"]={}
+
+            spec["postgresql"]["version"] = postgresql["spec"]["postgresql"]["version"]
 
     o['spec'].update(spec)
 
@@ -912,8 +956,7 @@ def get_operator_get_logs(worker: int):
 @app.route('/operator/clusters/<namespace>/<cluster>/logs')
 @authorize
 def get_operator_get_logs_per_cluster(namespace: str, cluster: str):
-    team, clustername = cluster.split('-', 1)
-    return proxy_operator(f'/clusters/{team}/{namespace}/{clustername}/logs/')
+    return proxy_operator(f'/clusters/{namespace}/{cluster}/logs/')
 
 
 @app.route('/login')
